@@ -782,17 +782,24 @@ def extract_result(after_label: str, known_limit):
 
 
 def find_overall_result(text: str) -> str:
-    m = re.search(r"(overall|final|sample|batch|result)\s*"
-                  r"(?:status|result|disposition)?\s*[:\-]?\s*(pass|fail|passed|failed)",
-                  text, re.I)
+    """The COA's OVERALL/summary verdict. CRITICAL: the ubiquitous "Pass/Fail" (or "Pass / Fail") COLUMN
+    HEADER must NOT be read as an overall FAIL — that false-matched the word "fail" on ~71% of modern COAs
+    (23,793 of 23,834 cached FAILs had no actual failing value). Strip those header tokens first, require the
+    verdict next to an overall-status LABEL, and NEVER guess FAIL from a stray "fail" token (return "" =
+    unknown instead — honest, not a false FAIL)."""
+    # 1) remove the column-header tokens ("Pass/Fail", "Pass / Fail", "Fail/Pass") that are NOT a verdict
+    t = re.sub(r"pass\s*[/|]\s*fail|fail\s*[/|]\s*pass", " ", text, flags=re.I)
+    # 2) an explicit overall verdict sitting next to an overall-status label
+    m = re.search(r"\b(overall|final|sample|batch|disposition|result)\s*"
+                  r"(?:status|result|disposition)?\s*[:\-]\s*(passed|failed|pass|fail)\b", t, re.I)
     if m:
-        return m.group(2).upper().rstrip("ED") + ("ED" if m.group(2).lower().endswith("ed") else "")
-    head = text[:1200]
-    if re.search(r"\bfail(ed)?\b", head, re.I):
-        return "FAIL"
-    if re.search(r"\bpass(ed)?\b", head, re.I):
-        return "PASS"
-    return ""
+        return "FAIL" if m.group(2).lower().startswith("fail") else "PASS"
+    # 3) a clear standalone overall-status verdict line (require the status word, not a bare token)
+    m2 = re.search(r"\b(overall|final\s+sample|batch)\s+(?:status|result|disposition)\s+(passed|failed|pass|fail)\b",
+                   t, re.I)
+    if m2:
+        return "FAIL" if m2.group(2).lower().startswith("fail") else "PASS"
+    return ""   # unknown — do NOT infer FAIL from a stray "fail" token (that was the false-FAIL bug)
 
 
 SECTION_HEADERS = (r"pesticides?|residual\s+solvents?|\bsolvents?|mycotoxins?|"
@@ -1162,6 +1169,153 @@ def parse_columnar_metals_myco(text, p):
                                    "limit": MYCOTOXIN_LIMIT, "_below_detect": True}
 
 
+_COLMETAL_DISPLAY = {"arsenic": "Arsenic", "cadmium": "Cadmium", "chromium": "Chromium",
+                     "lead": "Lead", "mercury": "Mercury"}
+# KNOWN Connecticut legal heavy-metal action limits, µg/kg (inhaled cannabis). COLUMN-MAJOR metal results
+# are in µg/kg, so this is the unit-safe authoritative comparator (per user: compare to the KNOWN CT legal
+# limits, not a possibly-garbled OCR'd limit column).
+_CT_METAL_UGKG = {"arsenic": 200.0, "cadmium": 200.0, "chromium": 600.0, "lead": 500.0, "mercury": 100.0}
+_COLMETAL_VAL = re.compile(r"^(ND|[<≤]?\s*\d[\d,]*\.?\d*|not\s+detect\w*.*|detected.*)$", re.I)
+_COLMETAL_NUM = re.compile(r"^[<≤]?\s*\d[\d,]*\.?\d*$")
+
+# EVERY contaminant (not just chromium): name pattern -> (key, CT legal limit, unit, kind). Ordered specific
+# -> general (STEC before E. coli). Numeric kinds carry a known CT limit; 'nd' kinds are zero-tolerance
+# pathogens (ANY detection = fail). This lets the COLUMN-MAJOR recovery surface an over-limit yeast & mold,
+# aerobic count, mycotoxin, metal, or a detected pathogen even when the COA's overall verdict reads PASS.
+_COL_ANALYTE_SPECS = [
+    (re.compile(r"total\s+yeast|yeast\s*&?\s*mold|\btymc\b", re.I), "tymc", 100000.0, "CFU/g", "numeric"),
+    (re.compile(r"aerobic|total\s+viable|\btamc\b|aerobic\s+plate", re.I), "aerobic", 100000.0, "CFU/g", "numeric"),
+    (re.compile(r"\barsenic\b", re.I), "arsenic", 200.0, "ug/kg", "numeric"),
+    (re.compile(r"\bcadmium\b", re.I), "cadmium", 200.0, "ug/kg", "numeric"),
+    (re.compile(r"\bchromium\b", re.I), "chromium", 600.0, "ug/kg", "numeric"),
+    (re.compile(r"\blead\b", re.I), "lead", 500.0, "ug/kg", "numeric"),
+    (re.compile(r"\bmercury\b", re.I), "mercury", 100.0, "ug/kg", "numeric"),
+    (re.compile(r"aflatoxin", re.I), "aflatoxin", 20.0, "ug/kg", "numeric"),
+    (re.compile(r"ochratoxin", re.I), "ochratoxin", 20.0, "ug/kg", "numeric"),
+    (re.compile(r"shiga|\bstec\b", re.I), "stec", None, "", "nd"),
+    (re.compile(r"salmonella", re.I), "salmonella", None, "", "nd"),
+    (re.compile(r"listeria", re.I), "listeria", None, "", "nd"),
+    (re.compile(r"aspergillus", re.I), "aspergillus", None, "", "nd"),
+    (re.compile(r"\be\.?\s*coli\b", re.I), "ecoli", None, "", "nd"),
+]
+
+
+def _match_col_analyte(name):
+    nl = (name or "").strip()
+    if not nl or _COLMETAL_NUM.match(nl):
+        return None
+    for rx, key, lim, unit, kind in _COL_ANALYTE_SPECS:
+        if rx.search(nl):
+            return key, lim, unit, kind, nl
+    return None
+
+
+_COL_UNIT_FAMILY = {"ug/kg": "mass", "mg/kg": "mass", "µg/kg": "mass", "ppm": "mass", "ppb": "mass",
+                    "cfu/g": "microbial", "cfu/ml": "microbial"}
+# A column-major metal value this large (in µg/kg) is biologically implausible for a legal-market product
+# (50 ppm) — it is an OCR mis-pair (e.g. a microbial CFU/g value), NOT a real exceedance. Backstop only;
+# the primary guard is unit-family consistency below.
+_COL_METAL_MAX_UGKG = 50_000.0
+
+
+def _col_unit_family(u):
+    return _COL_UNIT_FAMILY.get((u or "").strip().lower().replace("µ", "u"), "")
+
+
+def parse_columnar_metals_status(text, p):
+    """Recover EVERY CONTAMINANT (yeast & mold, total aerobic, pathogens, mycotoxins, all heavy metals) from
+    a COLUMN-MAJOR OCR layout (e.g. AnalytiCs Labs CT) where the analyte NAMES and the RESULTS column are
+    each OCR'd top-to-bottom as separate blocks — so e.g. 'Chromium' never lands next to its value
+    '1205.6127' and the generic parser cannot pair them. Pairs a contiguous run of KNOWN analyte names 1:1
+    with the COA's Results column BY ROW INDEX, then records each numeric result against the KNOWN CT legal
+    limit (and detected pathogens), so an over-limit body line surfaces even when the COA's overall verdict
+    reads PASS. Conservative: only when a name run aligns exactly with a Results column; never clobbers an
+    analyte already parsed with a value; ND / below-detect / 'Not Detected' results are skipped.
+
+    UNIT-FAMILY GUARD (accuracy-critical): the Results column matched to a name run carries a unit header
+    (µg/kg vs CFU/g). A metals/mycotoxin name run (mass units) is paired ONLY with a mass-unit Results
+    column, and a microbial run ONLY with a CFU/g column — so a forward 'Results' block from a DIFFERENT
+    table (e.g. a microbial CFU/g column) can never be mis-paired to metal names (which produced false
+    'Cadmium = 97,000 µg/kg' criticals that were actually microbial CFU/g values)."""
+    lines = [l.strip() for l in (text or "").splitlines()]
+    nL = len(lines)
+
+    def _column(label, after, n):
+        """Return (values, unit_seen) for the first `label` column after `after` that yields exactly n
+        value rows, capturing the unit header (µg/kg / CFU/g / …) printed within that column."""
+        for k in range(after, min(after + 80, nL)):
+            if lines[k].lower() == label:
+                vals, unit_seen, m = [], "", k + 1
+                while m < nL and len(vals) < n:
+                    s = lines[m].strip()
+                    if not s:
+                        m += 1
+                        continue
+                    if s.lower() in ("ug/kg", "mg/kg", "µg/kg", "ppm", "ppb", "cfu/g", "cfu/ml"):
+                        if not unit_seen:
+                            unit_seen = s.lower()
+                        m += 1
+                        continue
+                    if _COLMETAL_VAL.match(s):
+                        vals.append(s)
+                        m += 1
+                    else:
+                        break
+                if len(vals) == n:
+                    return vals, unit_seen
+        return None, ""
+
+    i = 0
+    while i < nL:
+        run, j = [], i
+        while j < nL:
+            mt = _match_col_analyte(lines[j])
+            if mt:
+                run.append(mt)
+                j += 1
+            else:
+                break
+        if len(run) < 2:
+            i += 1
+            continue
+        n = len(run)
+        results, col_unit = _column("results", j, n)
+        if not results:
+            i = j
+            continue
+        col_family = _col_unit_family(col_unit)
+        for idx, (key, lim, unit, kind, name) in enumerate(run):
+            rv = results[idx]
+            rl = rv.lower()
+            ex = p.analytes.get(key)
+            # CROSS-TABLE GUARD: if the Results column's unit family disagrees with this analyte's expected
+            # unit family, the column belongs to a DIFFERENT table — never pair (no false attribution).
+            exp_family = _col_unit_family(unit)
+            if col_family and exp_family and col_family != exp_family:
+                continue
+            if kind == "nd":
+                # zero-tolerance pathogen: only a POSITIVE detection matters
+                if "detect" in rl and "not" not in rl and "non" not in rl:
+                    if not ex or ex.get("status") != "DETECTED":
+                        p.analytes[key] = {"raw": rv, "value": None, "status": "DETECTED", "name": name}
+                continue
+            if rv.upper() == "ND" or rv.startswith(("<", "≤")) or "not detect" in rl:
+                continue                              # not detected / below-detect bound
+            try:
+                val = float(rv.replace(",", ""))
+            except ValueError:
+                continue
+            # PLAUSIBILITY BACKSTOP: a mass-unit (metal/mycotoxin) value above 50 ppm is an OCR mis-pair,
+            # never a real legal-market result — skip rather than publish a false 'Critical' exceedance.
+            if exp_family == "mass" and val > _COL_METAL_MAX_UGKG:
+                continue
+            if ex and ex.get("value") not in (None, 0.0):
+                continue                              # don't clobber an analyte already parsed with a value
+            p.analytes[key] = {"raw": rv, "value": val, "status": "", "name": name,
+                               "unit": unit, "limit": lim}
+        i = j
+
+
 # AltaSci / USP COAs report microbial DETECTION LIMITS as powers of ten (10^2..10^6,
 # e.g. "Total Yeast & Mold Count < 10^4 CFU/g Passed"). PDF text extraction drops the
 # superscript so "< 10^6" flattens to "< 106" -- which the generic parser would read
@@ -1226,6 +1380,7 @@ def parse_analytes(text: str, p: Product):
     parse_mycotoxins(text, p)
     parse_columnar_micro(text, p)   # recover NELabs columnar yeast&mold / aerobic
     parse_columnar_metals_myco(text, p)   # Phase 8: recover NELabs columnar heavy metals + mycotoxins
+    parse_columnar_metals_status(text, p)  # recover COLUMN-MAJOR heavy metals (AnalytiCs-style Limit/Results)
     fix_usp_micro_powers(text, p)    # restore AltaSci/USP "< 10^X" detection limits
 
     # Plausibility guard: a CFU/g microbial count physically cannot approach 1e11 (a gram of pure

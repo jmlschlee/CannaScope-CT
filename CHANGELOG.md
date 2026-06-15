@@ -2,7 +2,45 @@
 
 All notable changes to this project are documented here.
 
-## V17.2.0 — current release
+## V17.4.0 — current release
+
+Regulatory-standard ACCURACY release. SOFTWARE_VERSION → 17.4.0; ANALYSIS_VERSION stays 17.3.0 (no
+detection-logic / threshold / finding change — this updates the baked-in regulatory REFERENCE standards
+and adds report identity detail). Published findings are unchanged; the standards the report cites are
+now correct.
+
+**THC potency cap — replaced the inaccurate "no cap" with CT's real, dated, triple-verified caps.** The
+`thc_potency` standard previously declared "No CT regulatory THC cap" for every year. Connecticut DOES cap
+Total THC for ADULT-USE sale, and the cap changed over time. `HISTORICAL_STANDARDS["thc_potency"]` is now
+seven dated, product-type-aware entries: medical era (pre-2023) no cap; adult-use FLOWER 30% (CT PA 21-1,
+RERACA) → 35% (CT PA 25-166, eff. 2025-10-01); adult-use CONCENTRATE / other non-vape 60% → 70% (PA 25-166,
+eff. 2025-10-01); VAPES exempt; EDIBLES 5 mg/serving · 100 mg/package (mg dose, not a %). Each entry is
+`verified=True` with a citation and a clear note that medical-only / legacy / vape products are EXEMPT.
+PA 26-8 (HB 5350, signed 2026-05-04) keeps 35% flower and removes the concentrate cap but is effective
+2026-10-01 — noted, not applied within current windows. Triple-verified 2026-06-15 against CGS Ch. 420h,
+CT PA 21-1, CT PA 25-166, CT PA 26-8, and multiple legal-firm / press summaries.
+
+**Standards display now shows the dated caps.** The "Applicable CT Standards by Test Date" table renders
+the flower/concentrate/vape/edible/medical THC rows with VERIFIED status and a `limit_display` (e.g.
+"exempt (vapes — no % cap)", "5 mg/serving · 100 mg/package", "no cap (medical era)"). The year-by-year
+ledger gained a "THC (AU flower)" column (30% → 35% at 2025-10-01) with an explanatory footnote.
+`CT_REG_CITATIONS["thc_potency"]`, `LEGAL_SOURCES["thc_potency"]` (PA 25-166 / PA 26-8 act PDFs), and
+`CT_REG_AS_OF` (→ 2026-06-15) updated; `LEGAL_FETCH_VERSION` 2 → 3 so stale legal-cache entries re-verify.
+
+**Why no auto-flagging of cap "violations".** The dataset's "Market" flag is brand-level, and the data
+shows ~53% of dual-market non-vape concentrates exceed 70% — largely lawful medical-only or vape-exempt
+products — so flagging cap exceedances as violations would be inaccurate. The caps are presented as
+VERIFIED reference standards instead.
+
+**Conflicting-COA tables now carry product + producer.** Each Multiple / Conflicting COA comparison table
+gained a tinted Product and Producer identity band spanning both result columns (and the within-document
+cases carry the same line), so a reviewer sees which product/producer each case concerns — not just lab
+names and dates. Rendering/identity only; conflict detection and counts unchanged.
+
+**Microbial / aerobic / pathogen / heavy-metal standards unchanged** — already verified, cited, and
+corroborated by the action limits printed on the COAs. Build: `python3 _make_v17.py`.
+
+## V17.2.0 
 
 Biggest upgrade since V17 — credibility, completeness, and readability. ANALYSIS_VERSION → 17.2.0 (detection
 logic changed).

@@ -78,11 +78,11 @@ ProductV5 = v5.ProductV5
 # Config
 # ============================================================================
 # Version label shown on the report cover, in output filenames, and in the footer.
-APP_NAME = "CannaScope CT V17.2.0"
+APP_NAME = "CannaScope CT V17.4.0"
 # Software version as it appears in the report FILENAME standard, e.g. "13" -> "...-V15-...".
 # Bump this (and APP_NAME) on a version change; the report-number sequence keeps going (global,
 # continuous, never resets) and filenames simply carry the new version token.
-SOFTWARE_VERSION = "17.2.0"
+SOFTWARE_VERSION = "17.4.0"
 FILE_VERSION_TAG = f"V{SOFTWARE_VERSION}"
 # Single source of truth for the actual shipped single-file name (major version only), used in EVERY
 # rendered/printed recommendation and disclaimer so the report never names a stale script (P4 fix).
@@ -326,7 +326,7 @@ SELF_IMPROVE_LOG = os.path.join(OUT_DIR, "Self-Improvement Log.json")
 # stamped AND every UNSTAMPED legacy-ledger record then becomes stale and is re-evaluated by the
 # `audit-cache` subcommand. (The existing legacy ledger is entirely unstamped, so all of it is a
 # re-eval candidate — which is exactly the pre-V16 concern: records skipped before newer logic.)
-ANALYSIS_VERSION = "17.2.0"   # BUMP on any detection-logic change (product-type guardrail, potency
+ANALYSIS_VERSION = "17.3.0"   # BUMP on any detection-logic change (product-type guardrail, potency
                               # math, microbial bound handling, limit selection, self-audit categories,
                               # multi-product per-product isolation). The clean-ledger is stamped with
                               # this; entries from an OLDER analysis version are NOT trusted as clean and
@@ -389,6 +389,81 @@ MATCH_PRODUCT_MISMATCH = "COA Product Mismatch"
 MATCH_VALUE_MISMATCH = "COA Value Mismatch"
 MATCH_MANUAL = "COA Needs Manual Review"
 PUBLISHABLE = {MATCH_EXACT, MATCH_PARTIAL}
+
+# ----------------------------------------------------------------------------
+# COVERAGE-GAP DIAGNOSIS (open item #2). For every COA held OUT of findings (status not in
+# PUBLISHABLE), record WHY — the exact, per-COA failure reason — so the Coverage Integrity Summary
+# can report the gap honestly instead of a bare count. DIAGNOSE-AND-REPORT ONLY: this reads the
+# already-recorded _coa_status + parse_note from the run; it never re-fetches or re-retrieves a COA
+# (per the standing "diagnose, don't aggressively re-pull" scope). Ordered most-specific-first.
+# ----------------------------------------------------------------------------
+GAP_REASON_LABELS = {
+    "broken_link":         "Broken or missing COA link (no document to read)",
+    "ocr_extraction":      "OCR / scanned-image extraction failed (no extractable text)",
+    "multiproduct_routing":"Multi-product COA routing — could not isolate this product's block",
+    "source_mismatch":     "COA source mismatch — product/value did not match the registry record",
+    "safety_incomplete":   "Printed safety panel did not parse (held for completeness)",
+    "parser_error":        "Parser / processing error",
+    "offline_uncached":    "Offline — COA not in cache (not verifiable this run)",
+    "schema_or_extract":   "Extraction failure (no usable measurement parsed)",
+    "manual_review":       "Held for manual review (reason not otherwise classified)",
+}
+
+
+def classify_coverage_gap(p):
+    """Diagnose WHY a COA fell into a coverage gap. Returns (reason_code, reason_label, detail).
+    Reads ONLY _coa_status + parse_note (+ the _safety_panel_incomplete marker) — no re-fetch."""
+    status = getattr(p, "_coa_status", "") or ""
+    note = (getattr(p, "parse_note", "") or "").strip()
+    nl = note.lower()
+    detail = note or status or "(no detail recorded)"
+    L = GAP_REASON_LABELS
+    if "multi-product" in nl or "could not isolate" in nl or ("ambiguous" in nl and "block" in nl):
+        return ("multiproduct_routing", L["multiproduct_routing"], detail)
+    if "no extractable text" in nl or "scanned image" in nl or "image-only" in nl:
+        return ("ocr_extraction", L["ocr_extraction"], detail)
+    if ("offline" in nl) and ("cache" in nl):
+        return ("offline_uncached", L["offline_uncached"], detail)
+    if status in (MATCH_LINK_BROKEN, MATCH_LINK_MISSING) or "could not download" in nl:
+        return ("broken_link", L["broken_link"], detail)
+    if status in (MATCH_PRODUCT_MISMATCH, MATCH_VALUE_MISMATCH):
+        return ("source_mismatch", L["source_mismatch"], detail)
+    if getattr(p, "_safety_panel_incomplete", False) or "did not parse" in nl or "safety panel" in nl:
+        return ("safety_incomplete", L["safety_incomplete"], detail)
+    if "processing error" in nl or "error:" in nl:
+        return ("parser_error", L["parser_error"], detail)
+    if "no usable measurement" in nl or "no numeric" in nl or "extraction" in nl:
+        return ("schema_or_extract", L["schema_or_extract"], detail)
+    return ("manual_review", L["manual_review"], detail)
+
+
+def coverage_gap_diagnosis(all_results, ident=None):
+    """Aggregate per-COA coverage-gap reasons across the run. Returns (reasons, rows):
+      reasons = [{code, label, count}, ...]  (descending by count) — the summary table.
+      rows    = [{product, producer, type, test_date, coa_status, reason_code, reason_label,
+                  detail, reg, report_url}, ...] — the full per-COA CSV. A 'gap' COA is any whose
+      _coa_status is NOT in PUBLISHABLE (held out of findings). Pure read; never re-fetches."""
+    from collections import Counter as _C
+    counts = _C()
+    rows = []
+    for p in all_results or []:
+        if getattr(p, "_coa_status", "") in PUBLISHABLE:
+            continue
+        code, label, detail = classify_coverage_gap(p)
+        counts[code] += 1
+        try:
+            producer = ident.resolve(p.producer)["label"] if ident else (getattr(p, "producer", "") or "")
+        except Exception:
+            producer = getattr(p, "producer", "") or ""
+        rows.append(dict(
+            product=tcase(getattr(p, "product_name", "") or ""), producer=producer,
+            type=tcase(getattr(p, "dosage_form", "") or ""), test_date=test_date(p),
+            coa_status=getattr(p, "_coa_status", "") or "", reason_code=code, reason_label=label,
+            detail=detail[:200], reg=getattr(p, "registration_number", "") or "",
+            report_url=getattr(p, "report_url", "") or ""))
+    reasons = [dict(code=c, label=GAP_REASON_LABELS.get(c, c), count=n)
+               for c, n in counts.most_common()]
+    return reasons, rows
 
 # Provenance verdict (independent of coverage): a run that did NO live verification is a CACHE REPLAY,
 # not a validated report. Surfaced as its own status tier + page-1 banner + a strict/forensic block.
@@ -2739,6 +2814,102 @@ def _analyte_class(key):
     return "Contaminant"
 
 
+# ============================================================================
+# CONTAMINANT-CLASS TAXONOMY — SINGLE SOURCE OF TRUTH (remediation intelligence layer, TASK 1).
+# ----------------------------------------------------------------------------
+# The one core principle: distinguish "remediation biologically possible" from "this contaminant
+# CANNOT be removed by ordinary cannabis remediation." Mold/yeast/microbes CAN be reduced or killed by
+# validated steps; elemental heavy metals (Cr, Pb, As, Cd, Hg) CANNOT — heat, radiation, ozone, RF and
+# microbial kill steps do not make an element disappear. Therefore a heavy-metal fail->pass is NOT an
+# ordinary remediation finding; it is a critical scientific/regulatory/consumer-disclosure finding.
+# EVERYTHING downstream (severity, labels, section routing) reads from THIS — no per-section hardcoding.
+#   remediation_possible: "yes" (validated kill/decontam) | "no" (elemental/toxin — not by ordinary
+#       remediation) | "sometimes" (must be PROVEN by the later COA) | "n/a" (not a safety remediation).
+# ============================================================================
+CLASS_BIOLOGIC = "Biologic / microbial"
+CLASS_HEAVY_METAL = "Elemental heavy metals"
+CLASS_CHEMICAL = "Chemical residues"
+CLASS_MYCOTOXIN = "Mycotoxins"
+CLASS_POTENCY = "Potency / cannabinoids"
+
+CONTAMINANT_CLASSES = {
+    CLASS_BIOLOGIC:    dict(remediation_possible="yes",       base_flag="High",
+        note="Reducible/killable by validated decontamination (irradiation/X-ray/e-beam/gamma, RF, "
+             "ozone, controlled heat/steam, extraction+filtration). Aspergillus may be inactivated but "
+             "stays high concern. A fail->pass is a potential remediation or retest event — NOT auto-fraud."),
+    CLASS_HEAVY_METAL: dict(remediation_possible="no",        base_flag="Critical",
+        note="Elemental. NOT removable by ordinary cannabis remediation (irradiation, ozone, RF, heat, "
+             "drying). A fail->pass requires a documented chain-of-custody + scientific explanation with "
+             "itemized retest values; a generic 'below action limits' is not sufficient transparency."),
+    CLASS_CHEMICAL:    dict(remediation_possible="sometimes", base_flag="High",
+        note="Reduction is sometimes possible (depends on compound/matrix/process) but must be PROVEN by "
+             "the later COA with itemized values — not a generic summary."),
+    CLASS_MYCOTOXIN:   dict(remediation_possible="no",        base_flag="Critical",
+        note="Killing the mold does NOT remove the toxin. A mold remediation without itemized mycotoxin "
+             "clearance leaves the toxin question open."),
+    CLASS_POTENCY:     dict(remediation_possible="n/a",       base_flag="Informational",
+        note="Not a safety remediation issue; potency shifts may reflect sampling, lab variance, "
+             "dilution, reformulation, or wrong-COA mapping."),
+}
+
+# Engine analyte KEYS (p.analytes) -> class. The conflict-category labels and free text are resolved by
+# contaminant_class() below; this exact-key map is the fast path.
+_CLASS_BY_KEY = {
+    "tymc": CLASS_BIOLOGIC, "aerobic": CLASS_BIOLOGIC, "coliform": CLASS_BIOLOGIC, "btgn": CLASS_BIOLOGIC,
+    "bile": CLASS_BIOLOGIC, "aspergillus": CLASS_BIOLOGIC, "ecoli": CLASS_BIOLOGIC, "stec": CLASS_BIOLOGIC,
+    "salmonella": CLASS_BIOLOGIC, "listeria": CLASS_BIOLOGIC, "enterobacter": CLASS_BIOLOGIC,
+    "arsenic": CLASS_HEAVY_METAL, "cadmium": CLASS_HEAVY_METAL, "chromium": CLASS_HEAVY_METAL,
+    "lead": CLASS_HEAVY_METAL, "mercury": CLASS_HEAVY_METAL,
+}
+HEAVY_METALS = ("arsenic", "cadmium", "chromium", "lead", "mercury")
+
+
+def contaminant_class(name):
+    """The contaminant class for an analyte KEY (p.analytes), a conflict-CATEGORY label, or a free-text
+    analyte/contaminant name. The single classifier the remediation layer uses everywhere."""
+    k = (name or "").strip().lower()
+    if not k:
+        return CLASS_POTENCY                      # unknown -> informational (never a safety upgrade)
+    if k.startswith("solvent:"):
+        return CLASS_CHEMICAL
+    for key, cls in _CLASS_BY_KEY.items():
+        if k == key or k.startswith(key):
+            return cls
+    if k.startswith("aflatoxin") or k.startswith("ochratoxin") or "mycotoxin" in k or k in MYCO_KEYS:
+        return CLASS_MYCOTOXIN
+    if any(m in k for m in HEAVY_METALS) or "heavy metal" in k:
+        return CLASS_HEAVY_METAL
+    if ("yeast" in k or "mold" in k or "aerobic" in k or "microb" in k or "pathogen" in k
+            or "coli" in k or "salmonella" in k or "listeria" in k or "aspergillus" in k
+            or "shiga" in k or "stec" in k or "enterobact" in k or "bile" in k):
+        return CLASS_BIOLOGIC
+    if "pestic" in k or "solvent" in k:
+        return CLASS_CHEMICAL
+    if "thc" in k or "cannabinoid" in k or "potency" in k or "cbd" in k or "terpene" in k:
+        return CLASS_POTENCY
+    return CLASS_CHEMICAL          # an unrecognized NAMED contaminant -> proven-by-COA middle class (safe)
+
+
+def remediation_possible(name):
+    """'yes' | 'no' | 'sometimes' | 'n/a' for an analyte/category — reads the taxonomy, never hardcoded."""
+    return CONTAMINANT_CLASSES[contaminant_class(name)]["remediation_possible"]
+
+
+def is_non_remediable(name):
+    """True for elemental heavy metals and mycotoxins — contaminants ordinary cannabis remediation CANNOT
+    remove. The scientific gate behind the 'Non-Remediable Elemental Contamination' surfacing."""
+    return contaminant_class(name) in (CLASS_HEAVY_METAL, CLASS_MYCOTOXIN)
+
+
+def class_base_flag(name):
+    """The taxonomy's base flag level for a fail->pass on this contaminant (Critical/High/Informational)."""
+    return CONTAMINANT_CLASSES[contaminant_class(name)]["base_flag"]
+
+
+def class_note(name):
+    return CONTAMINANT_CLASSES[contaminant_class(name)]["note"]
+
+
 def ombudsman_rows(pub, threshold=None):
     """Products that PASSED but came CLOSEST to a CT action limit on ANY contaminant.
     Each product's closeness = its single closest analyte (max % of its CT limit). Ranked
@@ -2874,13 +3045,48 @@ HISTORICAL_STANDARDS = {
              note="Per-metal limits differ and vary by product type; the report uses each COA's own stated limit."),
     ],
     "thc_potency": [
-        dict(start=(2012, 1, 1), end=None, lab="*", product_type="flower", limit=None, unit="% Total THC",
-             verified=True, no_cap=True, source="No CT regulatory THC cap — plausibility review only.",
-             note="Flower Total THC above ~35% is unusual and above ~45% implausible (label/parse review). "
-                  "Total THC = 0.877×THCA + Δ9-THC."),
-        dict(start=(2012, 1, 1), end=None, lab="*", product_type="infused", limit=None, unit="% Total THC",
-             verified=True, no_cap=True, source="No CT regulatory THC cap; concentrates/infused can legitimately exceed flower ranges.",
-             note="High potency on a concentrate/extract is expected; flag product-type mismatches only."),
+        # CT DOES cap THC potency for ADULT-USE sale, and the cap CHANGED over time. The caps below apply
+        # to products sold in the ADULT-USE channel; MEDICAL-only and pre-adult-use "legacy" products are
+        # EXEMPT, and VAPE cartridges are EXEMPT from the % cap. The dataset's "Market" flag is brand-level,
+        # so a high-potency item registered "Both" may still be lawfully sold medical-only — the report
+        # therefore treats these as REFERENCE standards, not an automatic violation test. Total THC =
+        # 0.877×THCA + Δ9-THC. Triple-verified 2026-06-15 (CT PA 21-1 RERACA; CT PA 25-166; CT PA 26-8).
+        # --- Medical era (before adult-use retail sales began 2023-01-10): no statutory potency cap ---
+        dict(start=(2012, 1, 1), end=(2023, 1, 10), lab="*", product_type="*", limit=None, unit="% Total THC",
+             verified=True, no_cap=True, limit_display="no cap (medical era)",
+             source="Medical marijuana program — no statutory THC potency cap (CT DCP medical program).",
+             note="Medical-era products; potency reviewed for plausibility only (Total THC = 0.877×THCA + Δ9-THC)."),
+        # --- Adult-use FLOWER / plant material: 30% (RERACA PA 21-1) → 35% (PA 25-166, eff. 2025-10-01) ---
+        dict(start=(2023, 1, 10), end=(2025, 10, 1), lab="*", product_type="flower", limit=30, unit="% Total THC",
+             verified=True, market="adult_use",
+             source="Adult-use cannabis flower / plant-material Total-THC cap 30% (CT PA 21-1, RERACA).",
+             note="Applies to ADULT-USE retail sale. Medical-only and legacy products EXEMPT; vapes EXEMPT. Cited: CT PA 21-1 (RERACA)."),
+        dict(start=(2025, 10, 1), end=None, lab="*", product_type="flower", limit=35, unit="% Total THC",
+             verified=True, market="adult_use",
+             source="Adult-use cannabis flower Total-THC cap raised 30% → 35% (CT PA 25-166, eff. 2025-10-01).",
+             note="Applies to ADULT-USE retail sale (eff. 2025-10-01). Medical-only/legacy EXEMPT; vapes EXEMPT. "
+                  "High-potency warning required above 30%. PA 26-8 (eff. 2026-10-01) keeps 35%. Cited: CT PA 25-166."),
+        # --- Adult-use CONCENTRATE / other non-vape products: 60% → 70% (PA 25-166, eff. 2025-10-01) ---
+        dict(start=(2023, 1, 10), end=(2025, 10, 1), lab="*", product_type="concentrate", limit=60, unit="% Total THC",
+             verified=True, market="adult_use",
+             source="Adult-use concentrate / other products excl. vapes Total-THC cap 60% (CT PA 21-1, RERACA).",
+             note="Applies to ADULT-USE retail sale; vapes EXEMPT; medical-only/legacy EXEMPT. Cited: CT PA 21-1."),
+        dict(start=(2025, 10, 1), end=None, lab="*", product_type="concentrate", limit=70, unit="% Total THC",
+             verified=True, market="adult_use",
+             source="Adult-use concentrate / other products excl. vapes Total-THC cap raised 60% → 70% (CT PA 25-166, eff. 2025-10-01).",
+             note="Applies to ADULT-USE retail sale (eff. 2025-10-01); vapes EXEMPT; medical-only/legacy EXEMPT. "
+                  "PA 26-8 (eff. 2026-10-01, AFTER this window) ELIMINATES the concentrate cap. Cited: CT PA 25-166."),
+        # --- Vape cartridges: EXEMPT from the % potency cap ---
+        dict(start=(2023, 1, 10), end=None, lab="*", product_type="vape", limit=None, unit="% Total THC",
+             verified=True, no_cap=True, limit_display="exempt (vapes — no % cap)",
+             source="Vape cartridges are EXEMPT from CT's adult-use THC potency caps (CT PA 21-1 / PA 25-166).",
+             note="No % cap on vape Total THC; plausibility review only."),
+        # --- Edibles / beverages: per-serving + per-package mg limits (NOT a % cap; not checkable from % data) ---
+        dict(start=(2023, 1, 10), end=None, lab="*", product_type="edible", limit=None, unit="mg",
+             verified=True, no_cap=True, limit_display="5 mg/serving · 100 mg/package",
+             source="Adult-use edibles limited to 5 mg THC per serving and 100 mg per package; infused beverages "
+                    "limited per container (CT PA 21-1 / PA 25-166). This is a mg dose limit, NOT a Total-THC % cap.",
+             note="mg-per-serving/package dose limit (not a Total-THC % cap); medical edibles may exceed these."),
     ],
 }
 
@@ -2967,7 +3173,7 @@ LEGAL_CACHE_TTL = 30 * 24 * 3600          # re-verify monthly; a cache is a hint
 # timeout, TLS/cert handling) — a cached entry whose stamp != current is treated as a miss and
 # re-fetched, so a fetch fix is never masked by stale "unreachable" entries from an older build.
 # (v1 = original; v2 = V15.1.1 live-source fix: fixed DCP URL + 25s timeout + GoDaddy-G2 chain.)
-LEGAL_FETCH_VERSION = 2
+LEGAL_FETCH_VERSION = 3
 LEGAL_UNVERIFIED = "Historical standard not verified — manual legal review needed"
 # CT primary sources consulted as a FALLBACK (domains are real; exact deep links may move — a 404
 # still counts as a logged, honest attempt and falls back to "unverified", never a crash/fabrication).
@@ -2979,6 +3185,14 @@ LEGAL_SOURCES = {
         ("CT DCP — Policies & Procedures for the Cannabis Program",
          "https://portal.ct.gov/cannabis/knowledge-base/articles/policies-and-procedures"),
     ],
+    "thc_potency": [
+        ("CT General Statutes — Chapter 420h (adult-use cannabis; THC potency caps)",
+         "https://www.cga.ct.gov/current/pub/chap_420h.htm"),
+        ("CT PA 25-166 — flower 30%→35%, concentrate/other 60%→70% (eff. 2025-10-01)",
+         "https://www.cga.ct.gov/2025/ACT/PA/PDF/2025PA-00166-R00SB-01445-PA.PDF"),
+        ("CT PA 26-8 (HB 5350) — keeps 35% flower, drops concentrate cap (eff. 2026-10-01)",
+         "https://www.cga.ct.gov/2026/ACT/PA/PDF/2026PA-00008-R00HB-05350-PA.PDF"),
+    ],
 }
 
 # ── Year-by-year CT regulatory ledger (the "bake in every year's standard" requirement) ───────────
@@ -2989,7 +3203,7 @@ LEGAL_SOURCES = {
 # differ by product type), so the report defers to each COA's OWN printed limit (live-first). The
 # program also re-consults the live CT sources each run (verify_standard) to record confirmation
 # freshness. CT_REG_AS_OF = the date these citations/values were last confirmed against CT sources.
-CT_REG_AS_OF = "2026-06-05"
+CT_REG_AS_OF = "2026-06-15"
 CT_REG_CITATIONS = {
     "yeast_mold":  ("RCSA §21a-408-58 / DCP Policies & Procedures (microbial); unified 100,000 CFU/g "
                     "+ zero detectable Aspergillus since ~July 2021 (CT Public investigative report, 2023-03-22)",
@@ -3002,7 +3216,9 @@ CT_REG_CITATIONS = {
     "heavy_metals":("RCSA §21a-408-58 / DCP Policies & Procedures — per-metal action limits (As / Cd / Pb / Hg / Cr), "
                     "which differ by product type (inhaled vs other); the report applies each COA's own printed limit",
                     "https://portal.ct.gov/cannabis/knowledge-base/articles/policies-and-procedures"),
-    "thc_potency": ("No CT regulatory THC cap (CGS Chapter 420h / DCP Policies & Procedures) — plausibility review only",
+    "thc_potency": ("CT adult-use Total-THC caps (medical & vapes EXEMPT): flower 30%→35% and concentrate/other "
+                    "60%→70% eff. 2025-10-01 (CT PA 21-1 RERACA; CT PA 25-166); edibles 5 mg/serving · 100 mg/package. "
+                    "PA 26-8 (eff. 2026-10-01) keeps 35% flower, drops the concentrate cap (after this window)",
                     "https://www.cga.ct.gov/current/pub/chap_420h.htm"),
 }
 
@@ -5252,6 +5468,16 @@ def build_pdf(out_path, report_no, ctx):
             clusters.append((prod, nm, n))
         if len(clusters) >= 4:
             break
+    # REMEDIATION LAYER (TASK 3/9): the non-remediable elemental-contamination events lead the summary —
+    # they are the most serious because ordinary remediation cannot explain them. Computed once here and
+    # reused by the dedicated SERIOUS CONCERN section below.
+    _nrf = non_remediable_findings(ctx.get("coa_conflicts") or [], ctx.get("flagged") or [])
+    _nrf_rev = sum(1 for r in _nrf if r.get("fail_then_pass"))
+    if _nrf:
+        _rev_tail = (f", incl. {_nrf_rev} fail&#8594;pass reversal(s)" if _nrf_rev else "")
+        mif.insert(0, f"<b>{len(_nrf)}</b> NON-REMEDIABLE elemental heavy-metal / mycotoxin event(s){_rev_tail} "
+                      "— a contaminant ordinary cannabis remediation CANNOT remove. See "
+                      "<b>Non-Remediable Elemental Contamination — SERIOUS CONCERN</b>.")
     if micro_over:
         mif.append(f"<b>{micro_over}</b> current over-limit microbial result(s) — yeast &amp; mold / aerobic over the CT limit.")
     if over_cur - micro_over > 0:
@@ -5425,6 +5651,94 @@ def build_pdf(out_path, report_no, ctx):
                          big=False, aligns=["C", "L", "L", "L", "R", "R", "C", "C"]))
         story.append(Spacer(1, 8))
 
+    # ==== NON-REMEDIABLE ELEMENTAL CONTAMINATION — SERIOUS CONCERN (remediation layer, TASK 3/4/5) ====
+    # Elemental heavy metals (Cr/Pb/As/Cd/Hg) + mycotoxins CANNOT be removed by ordinary cannabis
+    # remediation. Every class-B over-limit and fail->pass event is surfaced here with full forensics.
+    # Scientific facts only; requires a documented explanation; NEVER alleges fraud/intent.
+    story.append(H("Non-Remediable Elemental Contamination — SERIOUS CONCERN", color=RED))
+    if _nrf:
+        intro_box(
+            "<b>Unlike yeast and mold, an elemental heavy metal cannot be killed or neutralized by ordinary "
+            "cannabis remediation</b> (irradiation, ozone, radio frequency, heat, or drying). "
+            "<b>Elemental Heavy Metal Failure Cannot Be Treated Like Mold Remediation.</b> A heavy-metal "
+            "failure followed by a later pass requires a documented chain-of-custody and scientific "
+            "explanation, <b>including itemized retest values</b> — a generic later “below action "
+            "limits” result is not enough for consumer-facing transparency. The same applies to "
+            "mycotoxins: killing the mold does not remove the toxin. Each row below is a <b>lead to verify "
+            "against the linked COA, never a conclusion or an allegation of wrongdoing.</b>", color="#7a1f17")
+        _nr_rows = []
+        for i, r in enumerate(_nrf[:MAX_TABLE_ROWS], 1):
+            _fv = (clean_value(r["fail_value"], r.get("fail_unit", "")) if isinstance(r["fail_value"], (int, float))
+                   else (r.get("fail_raw") or ("DETECTED" if r.get("detected") else "over limit")))
+            _flim = clean_value(r["fail_limit"], r.get("fail_unit", "")) if isinstance(r["fail_limit"], (int, float)) else "—"
+            _pf = (f"{r['fail_pct']:.0f}% of limit ({r['fail_fold']:.2f}&times;)"
+                   if r.get("fail_pct") is not None else ("DETECTED — not allowed" if r.get("detected") else "over limit"))
+            _sev = r["severity"]
+            _achip = (f'<font color="#C0392B"><b>{esc(r["analyte"])}</b></font><br/>'
+                      f'<font size="7" color="#7a1f17">{esc(_sev)}</font>'
+                      + ("<br/><font size=\"7\" color=\"#C0392B\"><b>SEVERE CHROMIUM &ge;2&times;</b></font>"
+                         if r.get("severe_chromium") else ""))
+            _prodcell = (f'<b>{esc(r["product"])}</b><br/>{esc(producer_display(r.get("producer",""), r.get("product","")))}'
+                         + (f'<br/><font size="7">{esc(r["shared_id"])}</font>' if r.get("shared_id") else "")
+                         + (f'<br/><font size="7" color="#7a1f17">{esc(r["product_type_note"])}</font>'
+                            if r.get("product_type_note") else (f'<br/><font size="7">{esc(r.get("product_type",""))}</font>'
+                                                                if r.get("product_type") else "")))
+            _failcell = (f'<font color="#C0392B"><b>{esc(str(_fv))}</b></font><br/>'
+                         f'<font size="7">limit on COA {esc(str(_flim))}</font><br/>'
+                         f'<font size="7">{esc(_pf)}</font><br/>'
+                         f'<font size="7">{esc(r.get("fail_lab") or "lab n/a")} &middot; {esc(str(r.get("fail_date") or "date n/a"))}</font>')
+            if r.get("fail_then_pass"):
+                if r.get("itemized_later"):
+                    _lv = (clean_value(r["later_value"], r.get("fail_unit", "")) if isinstance(r["later_value"], (int, float))
+                           else (r.get("later_raw") or str(r.get("later_status") or "PASS")))
+                    _latercell = (f'<b>{esc(str(_lv))}</b> {esc(r.get("later_status") or "PASS")}<br/>'
+                                  f'<font size="7">{esc(r.get("later_lab") or "")} &middot; {esc(str(r.get("later_date") or ""))}</font>')
+                else:
+                    _latercell = ('<font color="#C0392B">generic “below action limits”</font><br/>'
+                                  '<font size="7">(NOT itemized)</font><br/>'
+                                  f'<font size="7">{esc(r.get("later_lab") or "")} &middot; {esc(str(r.get("later_date") or ""))}</font>')
+            else:
+                _latercell = '<font size="7">no later result on file (standalone exceedance)</font>'
+            if not r.get("fail_then_pass"):
+                _itemcell = "—"
+            elif r.get("transparency_failure"):
+                _itemcell = ('<font color="#C0392B"><b>TRANSPARENCY FAILURE</b></font><br/>'
+                             '<font size="7">later COA did not itemize this metal</font>')
+            else:
+                _itemcell = 'itemized &#10003;'
+            def _lnk(url, lab):
+                return (f'<link href="{esc(url)}"><font color="#1155CC"><u>{esc(lab)}</u></font></link>'
+                        if url else esc(lab or "—"))
+            _coacell = (_lnk(r.get("fail_coa"), r.get("fail_reg") or "fail COA")
+                        + (("<br/>" + _lnk(r.get("later_coa"), "later COA")) if r.get("fail_then_pass") and r.get("later_coa") else ""))
+            _nr_rows.append([Paragraph(str(i), cellc), Paragraph(_achip, cell), Paragraph(_prodcell, cell),
+                             Paragraph(_failcell, cell), Paragraph(_latercell, cell),
+                             Paragraph(_itemcell, cellc), Paragraph(_coacell, coacell)])
+        story.append(tbl(["#", "Analyte", "Product / Producer / Lot / Type", "Failing result (on its COA)",
+                          "Later result", "Itemized? / Transparency", "COAs"], _nr_rows,
+                         [0.3*inch, 1.1*inch, 2.05*inch, 1.7*inch, 1.6*inch, 1.15*inch, 0.95*inch],
+                         hc=RED, band="#f8d2d0", aligns=["C", "L", "L", "L", "L", "C", "L"]))
+        story.append(Paragraph(
+            "<b>This requires documented retesting, chain of custody, and itemized values</b> — not an "
+            "accusation. Legitimate possible explanations include: " + " ".join(NON_REMEDIABLE_LEGIT_EXPLANATIONS)
+            + " The failing value, the later value (or “generic below action limits”), both dates, "
+            "both labs, and whether the later COA itemized values are shown above; these events also appear in "
+            "the Executive Summary, the analyte/contaminant tables, the lab-change section, the producer/lab "
+            "accountability table, and the consumer-facing concern report.", note_st))
+        if any(r.get("severe_chromium") for r in _nrf):
+            story.append(Paragraph(
+                "<b>Severe Chromium Exceedance</b> (&ge; 2&times; the limit) is flagged above. Because chromium is "
+                "an elemental contaminant, ordinary microbial remediation cannot explain a later pass; the "
+                "failing-vs-later columns are shown side by side for direct comparison.", note_st))
+        overflow_note(len(_nrf), "coverage_gap_diagnosis.csv / conflicting_coa_results.csv", what="events")
+    else:
+        story.append(Paragraph(
+            "No non-remediable elemental-contamination events (heavy-metal or mycotoxin over-limit or "
+            "fail&#8594;pass) were detected in this run's dataset. Heavy-metal and mycotoxin results that "
+            "<i>did</i> parse appear in their contaminant sections; per-metal extraction coverage is in the "
+            "Heavy Metal Coverage page (Technical Validation appendix).", CTX))
+    story.append(Spacer(1, 8))
+
     # ---- SURGICAL FIX — COA Marked Pass — Over-Limit Line Items (internal contradictions) ----
     _opl = []
     for p in (ctx.get("all_results_for_audit") or []):
@@ -5582,10 +5896,20 @@ def build_pdf(out_path, report_no, ctx):
                 + f' · {esc(producer_short(c["members"][0]["p"], ident))}'
                 + (f'<br/><font color="#555">Shared identifier: {esc(c["shared_id"])}</font>'
                    if c["shared_id"] else ''), cell)
+            # Product + producer for the case — shown in BOTH the within-document detail and the
+            # cross-record comparison table, so every conflict case carries the full identity, not just
+            # the lab names and dates.
+            _strain_disp = (c["strain"] if (c["strain"]
+                            and c["strain"].lower() not in (c["product"] or "").lower()) else "")
+            _prod_disp = ((esc(c["product"]) if c["product"] else "&mdash;")
+                          + (f' &mdash; {esc(_strain_disp)}' if _strain_disp else '')
+                          + (f' &middot; {esc(c["product_type"])}' if c["product_type"] else ''))
+            _prod_producer = esc(producer_short(c["members"][0]["p"], ident) or c.get("producer") or "—")
             if c["kind"] == "within-document":
                 labs = c.get("labs_in_doc") or []
                 p0 = c["members"][0]["p"]
                 detail = Paragraph(
+                    f'<b>Product:</b> {_prod_disp} &nbsp;·&nbsp; <b>Producer:</b> {_prod_producer}<br/>'
                     f'<b>Test date:</b> {esc(a["date_str"] or "Unknown")} &nbsp;·&nbsp; '
                     f'<b>Lab identities detected in one document:</b> {esc(", ".join(labs) or "more than one")}.'
                     + (f'<br/><b>Page references:</b> {esc(c["timeline"])}.' if c.get("timeline") else ''), body_st)
@@ -5607,7 +5931,11 @@ def build_pdf(out_path, report_no, ctx):
                         if m.get("limit") is not None else "—")
             _coaid = lambda m: (getattr(m.get("p"), "registration_number", "") or "").strip()
             ca, cb = _coaid(a), _coaid(b)
+            # Identity rows so each comparison table CARRIES the product + producer itself (not only the
+            # heading line above it). Both COAs describe the SAME product/lot, so these span both columns.
             trows = [
+                [Paragraph("<b>Product</b>", cell), Paragraph(_prod_disp, cell), Paragraph("", cell)],
+                [Paragraph("<b>Producer</b>", cell), Paragraph(_prod_producer, cell), Paragraph("", cell)],
                 [Paragraph("<b>Lab</b>", cell), Paragraph(esc(a["lab"]), cell), Paragraph(esc(b["lab"]), cell)],
                 [Paragraph("<b>COA number</b>", cell), Paragraph(esc(ca or "—"), cell_nb), Paragraph(esc(cb or "—"), cell_nb)],
                 [Paragraph("<b>Test date</b>", cell), Paragraph(esc(a["date_str"] or "Unknown"), cell),
@@ -5625,6 +5953,12 @@ def build_pdf(out_path, report_no, ctx):
                               Paragraph(esc(b.get("pages") or "—"), cell)])
             comp = tbl(["", "Result A (earlier)", "Result B (later)"], trows,
                        [1.45*inch, 3.1*inch, 3.1*inch], hc=colors.HexColor(sc), band="#f6f6f6", big=False)
+            # Product/Producer apply to the whole case (same lot on both COAs) — span them across both
+            # result columns and tint them so they read as an identity band above the per-COA rows.
+            comp.setStyle(TableStyle([
+                ("SPAN", (1, 1), (2, 1)), ("SPAN", (1, 2), (2, 2)),
+                ("BACKGROUND", (0, 1), (-1, 2), colors.HexColor("#eef3f8")),
+            ]))
             # Explicit identical/different comparison flags so a reviewer can see at a glance WHAT (if
             # anything) changed between the two records for this same product identifier.
             _va, _vb = a.get("value"), b.get("value")
@@ -5730,6 +6064,58 @@ def build_pdf(out_path, report_no, ctx):
     # NOTE: the former "Top …" mini summary tables (Top Heavy Metal / Microbial / High Cannabinoid /
     # Lab Patterns / Remediation) were removed — they duplicated the full per-section tables below and
     # the Most-Important / Findings-at-a-Glance boxes above, adding length and page gaps for no new info.
+
+    # ---- LABS WITH ALTERED PASS / FAIL STATUS — failing results promoted out of the retest/conflict notes ----
+    _failfind = conflict_failure_findings(_conflicts)
+    if _failfind:
+        story.append(H("Labs With Altered Pass / Fail Status", color=RED))
+        intro_box("Products where a lab's pass/fail status was <b>altered</b> — a result that <b>FAILED its own COA "
+                  "limit (or was a prohibited detection)</b> for which a <b>later passing result exists for the same "
+                  "lot</b>. The failing over-limit value is surfaced here as a finding: a real exceedance happened, "
+                  "and a clean retest does not erase it. Each row is <b>interpreted by contaminant class</b>: a "
+                  "<b>microbial</b> reversal is a <i>potential remediation or retest event</i> (validated kill steps "
+                  "can reduce microbes — NOT an allegation), while an <b>elemental heavy-metal</b> or "
+                  "<b>mycotoxin</b> reversal is <font color='#C0392B'><b>NON-REMEDIABLE</b></font> and is detailed in "
+                  "the <b>Non-Remediable Elemental Contamination — SERIOUS CONCERN</b> section above. "
+                  "<b>Verify against the linked COA — a lead, not a conclusion.</b>", color="#7a1f17")
+        _ff_rows = []
+        for i, r in enumerate(_failfind[:MAX_TABLE_ROWS], 1):
+            _v = (clean_value(r["value"], r.get("unit", "")) if isinstance(r["value"], (int, float))
+                  else (r.get("raw") or str(r["value"])))
+            _l = clean_value(r["limit"], r.get("unit", "")) if isinstance(r["limit"], (int, float)) else "—"
+            _fold = (f"{round((r['value'] or 0) / r['limit'], 2)}&times;"
+                     if r.get("limit") and isinstance(r["value"], (int, float)) else "—")
+            _coa = (f'<link href="{esc(r["coa_url"])}"><font color="#1155CC"><u>{esc(r.get("reg") or "COA")}</u></font></link>'
+                    if r.get("coa_url") else esc(r.get("reg") or "—"))
+            _cls = r.get("contaminant_class") or contaminant_class(r.get("analyte_key") or r.get("category", ""))
+            if _cls in (CLASS_HEAVY_METAL, CLASS_MYCOTOXIN):
+                _interp = ('<font color="#C0392B"><b>NON-REMEDIABLE</b></font> — see SERIOUS CONCERN'
+                           + ("; later retest passed" if r["later_pass"] else ""))
+            elif _cls == CLASS_BIOLOGIC:
+                _interp = ("potential remediation / retest event"
+                           + ("; later retest passed" if r["later_pass"] else ""))
+            elif _cls == CLASS_CHEMICAL:
+                _interp = ("chemical — remediation must be PROVEN by the later COA"
+                           + ("; later retest passed" if r["later_pass"] else ""))
+            else:
+                _interp = ("later retest passed" if r["later_pass"] else "—")
+            _name = r.get("analyte") or r["category"]
+            _ff_rows.append([Paragraph(str(i), cellc),
+                             Paragraph(f'<font color="#C0392B"><b>{esc(_name)}</b></font>', cell),
+                             Paragraph(esc(tcase(r["product"])), cell),
+                             Paragraph(f'<font color="#C0392B"><b>{esc(_v)}</b></font>', cellr),
+                             Paragraph(esc(_l), cellr), Paragraph(_fold, cellr),
+                             Paragraph(f'<b>{esc(r["status"])}</b>', cellc),
+                             Paragraph(esc(r["lab"]), cell), Paragraph(esc(r["date"] or "—"), cellc),
+                             Paragraph(_interp, cell),
+                             Paragraph(_coa, coacell)])
+        story.append(tbl(["#", "Contaminant", "Product", "Failing Result", "Limit on COA", "Fold",
+                          "Status", "Lab", "Test Date", "Class / Interpretation", "COA"], _ff_rows,
+                         [0.3*inch, 1.2*inch, 1.7*inch, 1.1*inch, 0.95*inch, 0.55*inch, 0.65*inch,
+                          1.25*inch, 0.85*inch, 1.25*inch, 0.85*inch],
+                         hc=RED, band="#f8d2d0",
+                         aligns=["C", "L", "L", "R", "R", "R", "C", "L", "C", "L", "C"]))
+        story.append(Spacer(1, 8))
 
     # ---------------- FLAGGED FINDINGS BY PRODUCER (directly under Executive Summary) ----------------
     story.append(H("Flagged Findings by Producer"))
@@ -6219,6 +6605,33 @@ def build_pdf(out_path, report_no, ctx):
                 "Producer frequency may help identify where unusually low microbial readings cluster, but low "
                 "readings can be normal and are not proof of remediation. This is a consumer-awareness lead only.",
                 note_st))
+        # TASK 6 caveat — microbial remediation reduces VIABLE organisms but may not remove dead microbial
+        # material, toxins, allergens, or evidence of poor cultivation/storage. Killing mold is not proof the
+        # product was clean from the start, and mycotoxins are a SEPARATE test.
+        story.append(Paragraph(
+            "<i><b>Important:</b> microbial remediation reduces or kills <i>viable</i> organisms, but may NOT "
+            "remove dead microbial material, <b>toxins (mycotoxins)</b>, allergens, or evidence of poor "
+            "cultivation/storage — <b>killing mold is not proof the product was clean from the start.</b> "
+            "Mycotoxins (aflatoxins, ochratoxin A) are a separate test and must be checked separately.</i>", note_st))
+
+    # ---------------- MICROBIAL REMEDIATION WITHOUT MYCOTOXIN CLEARANCE (TASK 6) ----------------
+    _myco_gaps = mycotoxin_clearance_gaps(_conflicts)
+    if _myco_gaps:
+        story.append(H("Microbial Remediation Without Clear Mycotoxin Clearance", color="#9A3B12"))
+        intro_box("A yeast/mold or Aspergillus result that <b>FAILED then later PASSED</b> on the same lot, where "
+                  "<b>mycotoxins (aflatoxins / ochratoxin A) were not clearly retested afterward</b>. Because killing "
+                  "the mold does not remove its toxins, a microbial remediation without an itemized mycotoxin "
+                  "clearance leaves the toxin question open. <b>A review gap, not an accusation.</b>", color="#7a1f17")
+        _mg_rows = [[Paragraph(str(i), cellc), Paragraph(esc(tcase(g["product"])), cell),
+                     Paragraph(esc(producer_display(g.get("producer", ""), g.get("product", ""))), cell),
+                     Paragraph(esc(g.get("analyte", "")), cell), Paragraph(esc(str(g.get("date") or "—")), cellc),
+                     Paragraph((f'<link href="{esc(g["coa_url"])}"><font color="#1155CC"><u>COA</u></font></link>'
+                                if g.get("coa_url") else "—"), coacell)]
+                    for i, g in enumerate(_myco_gaps[:MAX_TABLE_ROWS], 1)]
+        story.append(tbl(["#", "Product", "Producer", "Remediated microbial", "Test Date", "COA"], _mg_rows,
+                         [0.35*inch, 3.0*inch, 2.7*inch, 1.7*inch, 1.0*inch, 0.85*inch],
+                         hc=colors.HexColor("#9A3B12"), band="#f6e7dd", aligns=["C", "L", "L", "L", "C", "C"]))
+        story.append(Spacer(1, 8))
 
     # (Lower-Concern Products + No Significant Findings render lower down, just before the Appendix —
     #  these reassurance/closure sections belong after the main findings + patient-safety reviews.)
@@ -6362,14 +6775,22 @@ def build_pdf(out_path, report_no, ctx):
         "dataset (live CT sources are also consulted each run). <b>VERIFIED (per-COA)</b> = the report "
         "judges each result against the action limit printed on its own COA. <b>N/A — no cap</b> = "
         "Connecticut sets no numeric limit for that category (a plausibility review is used instead). "
+        "<b>THC potency:</b> Connecticut <b>does</b> cap Total THC for <b>adult-use sale</b>, and the cap "
+        "<b>changed over time</b> — flower 30%→35% and concentrate/other-non-vape 60%→70% effective "
+        "2025-10-01 (CT PA 25-166); edibles are limited to 5&nbsp;mg/serving · 100&nbsp;mg/package. "
+        "<b>Medical-only and legacy products are EXEMPT, and vape cartridges are EXEMPT</b> from the % cap. "
+        "Because the dataset's market flag is brand-level, these are shown as reference standards (a "
+        "high-potency item registered for both markets may be lawfully sold medical-only). "
         "Always confirm the current exact text at eRegulations.ct.gov / DCP.", CTX))
     _CAT_LABELS = {"aerobic": "Total aerobic microbial count", "pathogens": "Pathogens (Salmonella / E. coli / Aspergillus)",
-                   "heavy_metals": "Heavy metals (As / Cd / Pb / Hg)", "thc_potency": "THC potency (plausibility)"}
+                   "heavy_metals": "Heavy metals (As / Cd / Pb / Hg)", "thc_potency": "THC potency cap (adult-use; medical/vape exempt)"}
     std_rows = []
     for cat, label in _CAT_LABELS.items():
         for e in HISTORICAL_STANDARDS.get(cat, []):
             win = f"{e['start'][0]}–{(e['end'][0] if e['end'] else 'present')}"
-            if isinstance(e.get("limit"), (int, float)):
+            if e.get("limit_display"):
+                lim = e["limit_display"]
+            elif isinstance(e.get("limit"), (int, float)):
                 lim = f"{e['limit']:,} {e.get('unit', '')}".strip()
             elif e.get("no_cap"):
                 lim = "no numeric cap (plausibility)"
@@ -6424,13 +6845,22 @@ def build_pdf(out_path, report_no, ctx):
         path = "Salmonella / STEC not detected" + (" + Aspergillus" if y >= 2020 else "")
         ymv = f"{ym['limit']:,} CFU/g" if ym and isinstance(ym.get("limit"), (int, float)) else "—"
         aev = f"{ae['limit']:,} CFU/g" if ae and isinstance(ae.get("limit"), (int, float)) else "—"
+        th = standard_for("thc_potency", d, product_type="flower")
+        thcv = (f"{th['limit']:.0f}% (AU)" if th and isinstance(th.get("limit"), (int, float))
+                else "no cap (med)")
         yr_rows.append([Paragraph(str(y), cellc), Paragraph(esc(ymv), cellc), Paragraph(esc(aev), cellc),
                         Paragraph(esc(path), cell),
-                        Paragraph("per-COA limit", cellc), Paragraph("no cap", cellc),
+                        Paragraph("per-COA limit", cellc), Paragraph(esc(thcv), cellc),
                         Paragraph('<font color="#1E7E34"><b>confirmed</b></font>', cellc)])
-    story.append(tbl(["Year", "Yeast & Mold", "Total Aerobic", "Pathogens", "Heavy metals", "THC", "Basis"],
-                     yr_rows, [0.7*inch, 1.3*inch, 1.3*inch, 2.9*inch, 1.2*inch, 0.8*inch, 1.0*inch],
+    story.append(tbl(["Year", "Yeast & Mold", "Total Aerobic", "Pathogens", "Heavy metals", "THC (AU flower)", "Basis"],
+                     yr_rows, [0.6*inch, 1.25*inch, 1.25*inch, 2.7*inch, 1.15*inch, 1.05*inch, 0.95*inch],
                      hc=NAVY, band="#eef2f5", aligns=["C", "C", "C", "L", "C", "C", "C"]))
+    story.append(Paragraph(
+        "<b>THC (AU flower)</b> = the Connecticut <b>adult-use</b> cannabis-flower Total-THC cap that applied that year "
+        "(30% from adult-use launch in 2023, raised to <b>35% effective 2025-10-01</b> by CT PA 25-166; non-vape "
+        "concentrate/other products were capped 60%→70% on the same date). <b>Medical-only and legacy products, and "
+        "all vape cartridges, are EXEMPT</b> from the % cap; edibles are limited to 5 mg/serving · 100 mg/package. "
+        "“no cap (med)” = the pre-2023 medical-only era had no statutory potency cap.", note_st))
     cite_rows = []
     for catkey, label in (("yeast_mold", "Yeast & mold"), ("aerobic", "Total aerobic"),
                           ("pathogens", "Pathogens / Aspergillus"), ("heavy_metals", "Heavy metals"),
@@ -6749,6 +7179,28 @@ def build_pdf(out_path, report_no, ctx):
         f"<i>Outstanding = broken/missing links {_ci_broken:,} + unreadable {_ci_unread:,} + verification-queue "
         f"{_ci_queue:,} + uncertain-held {_ci_held:,} + source-mismatch {_ci_mismatch:,}. These are coverage gaps "
         "held OUT of findings, itemized in the sections below.</i>", note_st))
+    # COVERAGE-GAP DIAGNOSIS (open item #2): the EXACT per-COA reason every gap COA was held out of
+    # findings — diagnosed from the run's own _coa_status + parse_note (never re-fetched). Full per-COA
+    # detail is in Data Exports/coverage_gap_diagnosis.csv.
+    _gap_reasons = _ci_au.get("coverage_gap_reasons") or []
+    _gap_total = sum(int(r.get("count", 0) or 0) for r in _gap_reasons)
+    story.append(Paragraph("Coverage-Gap Diagnosis — why each held-out COA was not published", miniH))
+    if _gap_total:
+        story.append(Paragraph(
+            f"Every one of the <b>{_gap_total:,}</b> COA(s) held out of findings this run, classified by the "
+            "exact recorded failure reason (OCR / PDF-structure / multi-product routing / source mismatch / "
+            "broken link / parser error / extraction). Diagnosed from this run's own status + parse notes — "
+            "no COA was re-fetched. Per-COA detail: <i>Data Exports/coverage_gap_diagnosis.csv</i>.", CTX))
+        _gap_tbl = [[Paragraph(esc(r["label"]), cell),
+                     Paragraph(f"<b>{int(r['count']):,}</b>", cellr),
+                     Paragraph(_ci_pct(int(r["count"]), _gap_total), cellr)] for r in _gap_reasons]
+        _gap_tbl.append([Paragraph("<b>Total held out of findings</b>", cell),
+                         Paragraph(f"<b>{_gap_total:,}</b>", cellr), Paragraph("100.0%", cellr)])
+        story.append(tbl(["Failure reason (per-COA)", "COAs", "% of gaps"], _gap_tbl,
+                         [5.4*inch, 1.4*inch, 1.4*inch], big=False, aligns=["L", "R", "R"]))
+    else:
+        story.append(Paragraph("No coverage gaps this run — every reviewed COA was published or already "
+                               "accounted for; nothing was held out for an unresolved failure reason.", CTX))
     # TASK 4 — the ONE reconciled verification breakdown, rendered from the SAME function the console prints
     # (verification_breakdown_lines) so the two surfaces can never disagree. Reads only the single-source
     # accounting object; the buckets sum to the window (the function fails loud otherwise).
@@ -7525,6 +7977,8 @@ def compute_run_audit(debug, date_trace, products, all_results, pub, flagged, co
                               excluded=expected[name][0] - a, appears_in_report=("yes" if name in in_report else "no"),
                               reason=("" if name in in_report else "no analyzable in-window COA (date-excluded / unreadable / cache-miss)")))
     missing = [r["producer"] for r in prod_rows if r["appears_in_report"] == "no"]
+    # COVERAGE-GAP DIAGNOSIS (open item #2): per-COA failure reason for every COA held out of findings.
+    gap_reasons, gap_rows = coverage_gap_diagnosis(all_results, ident)
     # status tier
     hi = []
     if in_window and pct_analyzed < 50:
@@ -7611,6 +8065,7 @@ def compute_run_audit(debug, date_trace, products, all_results, pub, flagged, co
         conflict_records_total=conf_total, conflict_records_inside_window=conf_in, conflict_records_outside_window=conf_out,
         producers_expected=len(expected), producers_actual=len(in_report & set(expected)), producers_missing=len(missing),
         missing_producers=missing, producer_rows=prod_rows,
+        coverage_gap_reasons=gap_reasons, coverage_gap_rows=gap_rows,
         status_tier=tier, base_status=base_status, cache_replay=cache_replay,
         failure_highlights=hi or ["No major coverage gaps detected this run."],
         recommended_next_actions=[
@@ -7809,17 +8264,24 @@ def top_cannabinoid_flower_rows(all_results, ident, lmap, n=100):
 
 _ANALYTE_DISPLAY = dict(ANALYTE_TABLES)
 COA_PASS_OVERLIMIT_FLAG = "COA Marked Pass But Contains Over-Limit Result"
+# Parses an engine OVER_CT_LIMIT flag, e.g. "OVER_CT_LIMIT: yeast & mold 120,000 CFU/g > 100,000 CFU/g (...)":
+#   1=analyte  2=result  (3=unit)  4=limit  (5=unit)
+_OVERLIM_RX = re.compile(r"OVER_CT_LIMIT:\s*(.+?)\s+([\d,]+(?:\.\d+)?)\s*([A-Za-z/%µ]+)?\s*[>≥]=?\s*"
+                         r"([\d,]+(?:\.\d+)?)\s*([A-Za-z/%µ]+)?", re.I)
 
 
 def coa_pass_overlimit_lines(p):
     """SURGICAL FIX — for a product whose COA OVERALL/summary status reads PASS, return the BODY lines that
-    are over the limit PRINTED ON THAT SAME COA (numeric result > printed limit), plus explicit panel FAIL /
-    pathogen DETECTED lines. Empty unless the overall is PASS AND a real body exceedance exists. The COA
-    header PASS never erases these. Robust on cache-rehydrated rows (reads p.analytes/flags, not the text)."""
+    are over the CT limit on that same COA, plus explicit panel FAIL / pathogen DETECTED lines. Empty unless
+    the overall is PASS AND a real body exceedance exists; the header PASS never erases these. Robust on
+    cache-rehydrated rows. Over-limit is taken from the ENGINE's authoritative OVER_CT_LIMIT flags (which use
+    the dated CT standard) — NOT a per-analyte 'limit' field, which the parser does not store; a stored limit
+    is also honored when present."""
     ov = (getattr(p, "overall_result", "") or "").upper()
     if ov not in ("PASS", "PASSED"):
         return []
-    lines = []
+    lines, seen = [], set()
+    # Path A — a per-analyte stored limit, when present (rare, but honored).
     for k, e in (getattr(p, "analytes", {}) or {}).items():
         v, lim = e.get("value"), e.get("limit")
         if v is None or lim in (None, 0) or e.get("_below_detect"):
@@ -7829,13 +8291,40 @@ def coa_pass_overlimit_lines(p):
         except (TypeError, ValueError):
             continue
         if fv > fl:
-            lines.append(dict(analyte=_ANALYTE_DISPLAY.get(k, k.replace("_", " ").title()),
-                              result=v, limit=lim, unit=e.get("unit", ""),
+            nm = _ANALYTE_DISPLAY.get(k, k.replace("_", " ").title())
+            lines.append(dict(analyte=nm, result=v, limit=lim, unit=e.get("unit", ""),
                               pct=round(100.0 * fv / fl, 1), fold=round(fv / fl, 2), status=e.get("status", "")))
-    if getattr(p, "pesticides", "") == "FAIL":
+            seen.add(nm.lower())
+    # Path B — the engine's OVER_CT_LIMIT flags (authoritative over-the-CT-limit detections, dated standard).
+    for f in (getattr(p, "flags", None) or []):
+        fs = str(f)
+        if not fs.startswith("OVER_CT_LIMIT"):
+            continue
+        m = _OVERLIM_RX.search(fs)
+        if m:
+            nm = m.group(1).strip()
+            if nm.lower() in seen:
+                continue
+            seen.add(nm.lower())
+            try:
+                fv = float(m.group(2).replace(",", "")); fl = float(m.group(4).replace(",", ""))
+                lines.append(dict(analyte=nm.title(), result=m.group(2), limit=m.group(4),
+                                  unit=(m.group(5) or m.group(3) or "").strip(),
+                                  pct=round(100.0 * fv / fl, 1) if fl else None,
+                                  fold=round(fv / fl, 2) if fl else None, status="OVER LIMIT"))
+            except (TypeError, ValueError, ZeroDivisionError):
+                lines.append(dict(analyte=nm.title(), result="over limit", limit="—", unit="",
+                                  pct=None, fold=None, status="OVER LIMIT"))
+        else:
+            nm = fs.split(":", 1)[1].strip()[:48]
+            if nm.lower() not in seen:
+                seen.add(nm.lower())
+                lines.append(dict(analyte=nm, result="over limit", limit="—", unit="",
+                                  pct=None, fold=None, status="OVER LIMIT"))
+    if getattr(p, "pesticides", "") == "FAIL" and "pesticides (panel)" not in seen:
         lines.append(dict(analyte="Pesticides (panel)", result="FAIL", limit="—", unit="",
                           pct=None, fold=None, status="FAIL"))
-    if getattr(p, "solvents", "") == "FAIL":
+    if getattr(p, "solvents", "") == "FAIL" and "residual solvents (panel)" not in seen:
         lines.append(dict(analyte="Residual Solvents (panel)", result="FAIL", limit="—", unit="",
                           pct=None, fold=None, status="FAIL"))
     try:
@@ -8094,6 +8583,13 @@ def write_outputs(ctx):
            [[c["category"], "yes" if c["is_core"] else "no", c["window_total"], c["reported_on"],
              c["numeric_parsed"], c["flagged"], c["pct_of_window"], c["pct_of_reporting"], c["status"]]
             for c in _aud.get("category_coverage", [])])
+        # COVERAGE-GAP DIAGNOSIS (open item #2): per-COA failure reason for every held-out COA.
+        _w(P("coverage_gap_diagnosis.csv"),
+           ["product", "producer", "type", "test_date", "coa_status", "reason_code", "reason",
+            "detail", "registration_number", "report_url"],
+           [[r["product"], r["producer"], r["type"], r["test_date"], r["coa_status"], r["reason_code"],
+             r["reason_label"], r["detail"], r["reg"], r["report_url"]]
+            for r in _aud.get("coverage_gap_rows", [])])
     # P3 FORENSIC: raw-PDF SHA-256 for every reviewed COA (tamper-evident provenance) — only in forensic mode.
     if (ctx.get("debug") or {}).get("forensic_mode"):
         import hashlib as _hl
@@ -8253,6 +8749,24 @@ def write_outputs(ctx):
          (c["lab1"].get("pages") or c["lab2"].get("pages") or ""),
          c["lab1"].get("coa_url", ""), c["lab2"].get("coa_url", "")]
         for i, c in enumerate(ctx.get("coa_conflicts", []), 1)])
+
+    # NON-REMEDIABLE ELEMENTAL CONTAMINATION (remediation layer, TASK 3) — every class-B / mycotoxin event.
+    _nrf_export = non_remediable_findings(ctx.get("coa_conflicts") or [], ctx.get("flagged") or [])
+    _w(P("non_remediable_elemental_contamination.csv"),
+       ["analyte", "contaminant_class", "severity", "product", "producer", "product_type", "shared_id",
+        "failing_value", "limit_on_coa", "pct_of_limit", "fold_over", "failing_lab", "failing_date",
+        "fail_then_pass", "later_value", "later_status", "later_lab", "later_date", "itemized_later",
+        "transparency_failure", "severe_chromium", "public_disclosure", "failing_coa", "later_coa", "interpretation"],
+       [[r["analyte"], r["cls"], r["severity"], r["product"], r["producer"], r.get("product_type", ""),
+         r.get("shared_id", ""), r.get("fail_value"), r.get("fail_limit"),
+         (round(r["fail_pct"], 1) if r.get("fail_pct") is not None else ""),
+         (round(r["fail_fold"], 3) if r.get("fail_fold") is not None else ""),
+         r.get("fail_lab", ""), r.get("fail_date", ""), ("yes" if r.get("fail_then_pass") else "no"),
+         r.get("later_value"), r.get("later_status", ""), r.get("later_lab", ""), r.get("later_date", ""),
+         ("" if r.get("itemized_later") is None else ("yes" if r.get("itemized_later") else "no")),
+         ("yes" if r.get("transparency_failure") else "no"), ("yes" if r.get("severe_chromium") else "no"),
+         r.get("public_disclosure", ""), r.get("fail_coa", ""), r.get("later_coa", ""), r.get("label", "")]
+        for r in _nrf_export])
 
     # convenient lab result groupings (boundary-clustering statistical screen)
     _conv_export = ctx.get("convenience") or {}
@@ -8808,7 +9322,8 @@ def _category_result(p, keys, watch, dmap):
     if keys == ["__pesticide_panel__"]:
         panel = getattr(p, "pesticides", "")
         if panel in ("PASS", "FAIL"):
-            return dict(status=panel, value=None, limit=None, unit="", raw=panel)
+            return dict(status=panel, value=None, limit=None, unit="", raw=panel,
+                        analyte_key="__pesticide_panel__", analyte="Pesticides (panel)")
         return None
     best = None
     for k in keys:
@@ -8840,6 +9355,12 @@ def _category_result(p, keys, watch, dmap):
                 cand = dict(status=("FAIL" if (lim and val > lim) else "PASS"),
                             value=val, limit=lim, unit=(d or {}).get("unit", "") or e.get("unit", ""),
                             raw=raw)
+        # Remediation layer (TASK 2/5): preserve WHICH specific analyte produced this category record
+        # (e.g. the exact metal within "Heavy metals") so the non-remediable/Chromium logic can name it.
+        # Additive only — does not change which records conflict or their count.
+        if cand is not None:
+            cand["analyte_key"] = k
+            cand["analyte"] = _ANALYTE_DISPLAY.get(k, k.replace("_", " ").title())
         if cand and (best is None
                      or _STATUS_RANK.get(cand["status"], 0) > _STATUS_RANK.get(best["status"], 0)
                      or (_STATUS_RANK.get(cand["status"], 0) == _STATUS_RANK.get(best["status"], 0)
@@ -8879,7 +9400,8 @@ def build_conflict_fingerprint(p, watch):
         if rec:
             cats[label] = {"status": rec["status"], "value": rec.get("value"),
                            "limit": rec.get("limit"), "unit": rec.get("unit", ""),
-                           "raw": rec.get("raw", "")}
+                           "raw": rec.get("raw", ""),
+                           "analyte_key": rec.get("analyte_key", ""), "analyte": rec.get("analyte", "")}
     dt = _conflict_date(p)
     return {
         "coa_key": v4.coa_key(p),
@@ -8915,8 +9437,248 @@ def _member(cfp, rec, pages_note=""):
                 date=(tuple(dt) if dt else None), date_str=cfp.get("date_str", "") or "",
                 status=rec["status"], value=rec.get("value"), limit=rec.get("limit"),
                 unit=rec.get("unit", ""), raw=rec.get("raw", ""),
+                analyte_key=rec.get("analyte_key", ""), analyte=rec.get("analyte", ""),
                 coa_url=cfp.get("report_url", "") or "", reg=cfp.get("reg", "") or "",
                 pages=pages_note)
+
+
+def conflict_failure_findings(coa_conflicts):
+    """Promote EVERY failing / over-limit result captured in the conflicting-COA records into a first-class
+    findings list. A real exceedance (e.g. Chromium 1,205.613 µg/kg over a 600 limit) must NEVER be demoted
+    to a mere 'data changed / retest' note just because a LATER passing retest exists — the failure happened.
+    Returns one de-duplicated row per FAIL/DETECTED member: category, value, limit, lab, date, COA, and
+    whether a later passing result exists for the same lot. Pure read of the conflict records (no re-scan)."""
+    out, seen = [], set()
+    for c in (coa_conflicts or []):
+        for side in ("lab1", "lab2"):
+            m = c.get(side) or {}
+            if str(m.get("status", "")).upper() not in ("FAIL", "DETECTED"):
+                continue
+            key = (c.get("category", ""), str(m.get("value")), m.get("lab", ""), m.get("date_str", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            # The SPECIFIC analyte (e.g. the exact metal) + its contaminant class, so a microbial reversal
+            # and a heavy-metal reversal are labeled and routed differently (remediation layer T2/T8).
+            _akey = m.get("analyte_key") or ""
+            _aname = m.get("analyte") or c.get("category", "")
+            _cls = contaminant_class(_akey or c.get("category", ""))
+            out.append(dict(category=c.get("category", ""), product=c.get("product", ""),
+                            producer=c.get("producer", ""), lab=m.get("lab", ""),
+                            date=m.get("date_str", ""), value=m.get("value"), limit=m.get("limit"),
+                            unit=m.get("unit", ""), raw=m.get("raw", ""), status=m.get("status", ""),
+                            coa_url=m.get("coa_url", ""), reg=m.get("reg", ""),
+                            shared_id=c.get("shared_id", ""), later_pass=bool(c.get("fail_then_pass")),
+                            severity=c.get("severity", ""),
+                            analyte=_aname, analyte_key=_akey, contaminant_class=_cls,
+                            remediation_possible=CONTAMINANT_CLASSES[_cls]["remediation_possible"]))
+    # most severe / largest exceedance first
+    out.sort(key=lambda r: (0 if r["status"] == "FAIL" else 1,
+                            -((r["value"] or 0) / r["limit"]) if r.get("limit") else 0))
+    return out
+
+
+# ============================================================================
+# REMEDIATION INTELLIGENCE LAYER — class-aware labeling, severity, transparency, and the
+# "Non-Remediable Elemental Contamination — SERIOUS CONCERN" surfacing (TASKS 2/3/4/5/6/8).
+# Every function here READS the contaminant-class taxonomy (TASK 1) — no per-section hardcoded classes.
+# Legal-safety: state scientific facts, require documented explanation, NEVER allege fraud/intent.
+# ============================================================================
+NON_REMEDIABLE_LEGIT_EXPLANATIONS = [
+    "a non-representative or contaminated first sample (sampling error);",
+    "a valid retest with a documented chain of custody;",
+    "validated physical/chemical purification or separation (in an extract);",
+    "the contaminated portion removed/destroyed and only clean material retested;",
+    "a legally documented dilution or blending step;",
+    "an amended COA correcting an error in the original; or",
+    "an erroneous first OR second laboratory test.",
+]
+
+
+def remediation_event_label(name):
+    """TASK 2 — class-aware label for a fail->pass / over-limit event (reads the taxonomy)."""
+    return {
+        CLASS_HEAVY_METAL: "Non-remediable elemental contaminant fail converted to pass — requires documented explanation",
+        CLASS_MYCOTOXIN:   "Mycotoxin event — killing the mold does not remove the toxin; requires itemized mycotoxin clearance",
+        CLASS_CHEMICAL:    "Chemical contaminant fail converted to pass — requires documented remediation/retest explanation",
+        CLASS_BIOLOGIC:    "Potential microbial remediation or retest event",
+        CLASS_POTENCY:     "Potency change — informational review",
+    }.get(contaminant_class(name), "Result change — review")
+
+
+def remediation_severity(name, *, fail_then_pass=False, over_limit=False, itemized_later=True,
+                         detected_pathogen=False, near_limit=False):
+    """TASK 8 — severity per the matrix, driven by CLASS + result + disclosure state. Guarantees that a
+    heavy-metal (or mycotoxin) fail->pass / over-limit is NEVER scored below Critical."""
+    cls = contaminant_class(name)
+    if cls in (CLASS_HEAVY_METAL, CLASS_MYCOTOXIN):
+        return "Critical" if (fail_then_pass or over_limit or detected_pathogen) else "High"
+    if cls == CLASS_BIOLOGIC:
+        if detected_pathogen and fail_then_pass:
+            return "Critical"     # e.g. Aspergillus detected then later absent without disclosure
+        if fail_then_pass or over_limit:
+            return "High"
+        return "Medium" if near_limit else "Low"
+    if cls == CLASS_CHEMICAL:
+        if fail_then_pass or over_limit:
+            return "High"
+        return "Medium" if near_limit else "Low"
+    return "Low"
+
+
+# TASK 4/5 — detect a GENERIC heavy-metals pass ("below action limits") with NO itemized per-metal values.
+_GENERIC_METALS_PASS_RX = re.compile(
+    r"(heavy\s*metals?[^\n]{0,60}?below\s+action\s+(?:limits?|levels?))|"
+    r"((?:arsenic|cadmium|lead|mercury|chromium|as|cd|pb|hg|cr)\s*,?\s*"
+    r"(?:[, ]+(?:arsenic|cadmium|lead|mercury|chromium|as|cd|pb|hg|cr))*[^\n]{0,40}?"
+    r"below\s+action\s+(?:limits?|levels?))", re.I)
+_ITEMIZED_METAL_NUM_RX = re.compile(
+    r"(arsenic|cadmium|lead|mercury|chromium)[^\n]{0,40}?<?\s*\d[\d.,]*\s*"
+    r"(?:ug/kg|µg/kg|µg/kg|mg/kg|ppm|ppb)", re.I)
+
+
+def metals_generic_pass(text):
+    """TASK 4 — True iff a COA reports heavy metals only as a GENERIC 'below action limits' / 'below action
+    levels' WITHOUT itemized per-metal numeric values. The absence of itemized values (especially after a
+    prior fail) is itself a flagged transparency condition."""
+    t = text or ""
+    if not _GENERIC_METALS_PASS_RX.search(t):
+        return False
+    return not bool(_ITEMIZED_METAL_NUM_RX.search(t))
+
+
+def _product_overlimit_metals(p):
+    """(analyte, value, limit, unit, pct, fold) for each elemental heavy metal whose measured value is over
+    the limit printed on its own COA. Read from p.analytes directly (where the engine stores value+limit
+    when it flags OVER_CT_LIMIT for a metal), so it is robust to the flag-string wording. Class-filtered
+    via the taxonomy; below-detection bounds are never an exceedance."""
+    out, seen = [], set()
+    for k, e in (getattr(p, "analytes", {}) or {}).items():
+        if not isinstance(e, dict) or contaminant_class(k) != CLASS_HEAVY_METAL:
+            continue
+        v, lim = e.get("value"), e.get("limit")
+        if v is None or lim in (None, 0) or e.get("_below_detect"):
+            continue
+        try:
+            fv, fl = float(v), float(lim)
+        except (TypeError, ValueError):
+            continue
+        if fv <= fl or k in seen:
+            continue
+        seen.add(k)
+        nm = _ANALYTE_DISPLAY.get(k, k.replace("_", " ").title())
+        out.append((nm, fv, fl, e.get("unit", "") or "", 100.0 * fv / fl, fv / fl))
+    return out
+
+
+def _nr_row(cls, analyte, product, producer, ptype, shared_id, a, b, ftp, itemized_later):
+    """One SERIOUS-CONCERN row from an adverse member `a` (FAIL/DETECTED) and an optional later/clean
+    member `b`. Carries the full forensic field set the section renders + the CSV exports."""
+    val, lim, unit = a.get("value"), a.get("limit"), a.get("unit", "")
+    numeric = isinstance(val, (int, float))
+    pct = (100.0 * val / lim) if (numeric and lim) else None
+    fold = (val / lim) if (numeric and lim) else None
+    detected = str(a.get("status", "")).upper() == "DETECTED"
+    over = (fold is not None and fold > 1.0) or detected
+    sev = remediation_severity(analyte, fail_then_pass=ftp, over_limit=over, detected_pathogen=detected,
+                               itemized_later=(True if itemized_later is None else itemized_later))
+    transparency_failure = bool(ftp and itemized_later is False)
+    severe_chromium = (cls == CLASS_HEAVY_METAL and "chrom" in (analyte or "").lower()
+                       and fold is not None and fold >= 2.0)
+    pl = (ptype or "").lower()
+    if any(x in pl for x in ("vape", "cart", "concentrate", "extract", "oil", "distillate")):
+        ptype_note = "vape/concentrate — add hardware/process-contamination concern"
+    elif any(x in pl for x in ("flower", "bud", "pre-roll", "preroll", "shake", "trim")):
+        ptype_note = "flower — add plant-uptake / soil / nutrient concern"
+    elif any(x in pl for x in ("inhal", "smok", "vaporiz")):
+        ptype_note = "inhalable — elevated"
+    else:
+        ptype_note = ""
+    return dict(
+        cls=cls, analyte=analyte, product=product, producer=producer, product_type=ptype,
+        shared_id=shared_id, label=remediation_event_label(analyte),
+        fail_value=val, fail_limit=lim, fail_unit=unit, fail_pct=pct, fail_fold=fold,
+        fail_lab=a.get("lab", ""), fail_date=(a.get("date_str") or a.get("date") or ""),
+        fail_coa=a.get("coa_url", ""), fail_reg=a.get("reg", ""), fail_status=a.get("status", ""),
+        fail_raw=a.get("raw", ""),
+        later_value=(b.get("value") if b else None), later_lab=(b.get("lab", "") if b else ""),
+        later_date=((b.get("date_str") or "") if b else ""), later_coa=(b.get("coa_url", "") if b else ""),
+        later_status=(b.get("status", "") if b else ""), later_raw=(b.get("raw", "") if b else ""),
+        itemized_later=itemized_later, fail_then_pass=ftp, over_limit=over, detected=detected,
+        severity=sev, transparency_failure=transparency_failure, severe_chromium=severe_chromium,
+        product_type_note=ptype_note,
+        public_disclosure=("Later COA shows a clean pass — prior fail not disclosed on it" if ftp else "—"))
+
+
+def non_remediable_findings(conflicts, flagged):
+    """TASK 3 — every class-B (elemental heavy metal) and mycotoxin event ordinary cannabis remediation
+    CANNOT explain: over-limit exceedances AND fail->pass reversals, with full forensics. Built from the
+    conflict findings (both sides) PLUS standalone over-limit metals on published products. De-duplicated,
+    severity-ordered, never alleges fraud. Pure read."""
+    rows, seen = [], set()
+    for f in (conflicts or []):
+        cls = f.get("contaminant_class") or contaminant_class(f.get("analyte_key") or f.get("category", ""))
+        if cls not in (CLASS_HEAVY_METAL, CLASS_MYCOTOXIN):
+            continue
+        a = f.get("lab1") or {}
+        b = f.get("lab2") or {}
+        if str(a.get("status", "")).upper() not in ("FAIL", "DETECTED"):
+            adverse = [m for m in (f.get("members") or []) if str(m.get("status", "")).upper() in ("FAIL", "DETECTED")]
+            if not adverse:
+                continue
+            a = adverse[0]
+        analyte = a.get("analyte") or f.get("analyte") or f.get("category", "")
+        key = (f.get("product", ""), (analyte or "").lower(), str(a.get("value")))
+        if key in seen:
+            continue
+        seen.add(key)
+        ftp = bool(f.get("fail_then_pass"))
+        later_numeric = (b.get("value") is not None) and (str(b.get("status", "")).upper() in ("PASS", "ND"))
+        itemized_later = later_numeric if ftp else None
+        rows.append(_nr_row(cls, analyte, f.get("product", ""), f.get("producer", ""),
+                            f.get("product_type", ""), f.get("shared_id", ""), a,
+                            (b if ftp else None), ftp, itemized_later))
+    # standalone over-limit metals on published products (no same-lot conflict pair)
+    for p in (flagged or []):
+        if getattr(p, "_coa_status", "") not in PUBLISHABLE:
+            continue
+        prod = tcase(getattr(p, "product_name", "") or "")
+        for analyte, val, lim, unit, pct, fold in _product_overlimit_metals(p):
+            key = (prod, analyte.lower(), str(val))
+            if key in seen:
+                continue
+            seen.add(key)
+            a = dict(status="FAIL", value=val, limit=lim, unit=unit, raw=(str(val) if val is not None else ""),
+                     lab=getattr(p, "test_lab", "") or "", date_str=test_date(p),
+                     coa_url=getattr(p, "report_url", "") or "", reg=getattr(p, "registration_number", "") or "")
+            rows.append(_nr_row(CLASS_HEAVY_METAL, analyte, prod, getattr(p, "producer", "") or "",
+                                getattr(p, "dosage_form", "") or "", _shared_id_label(p), a, None, False, None))
+    rows.sort(key=lambda r: (_SEV_RANK.get(r["severity"], 0), r.get("fail_fold") or 0), reverse=True)
+    return rows
+
+
+def mycotoxin_clearance_gaps(conflicts):
+    """TASK 6 — a mold / Aspergillus fail->pass for which mycotoxins (aflatoxins / ochratoxin A) were NOT
+    clearly retested on the same lot afterward. Killing mold does not remove its toxins, so a microbial
+    remediation without a mycotoxin clearance is a documented review gap (not an accusation)."""
+    myco_lots = set()
+    for f in (conflicts or []):
+        if contaminant_class(f.get("analyte_key") or f.get("category", "")) == CLASS_MYCOTOXIN:
+            myco_lots.add(f.get("shared_id", ""))
+    out = []
+    for f in (conflicts or []):
+        cat = ((f.get("category") or "") + " " + (f.get("analyte") or "")).lower()
+        if not f.get("fail_then_pass"):
+            continue
+        if not ("mold" in cat or "yeast" in cat or "aspergillus" in cat):
+            continue
+        if f.get("shared_id", "") in myco_lots:
+            continue
+        out.append(dict(product=f.get("product", ""), producer=f.get("producer", ""),
+                        analyte=f.get("analyte") or f.get("category", ""), shared_id=f.get("shared_id", ""),
+                        coa_url=f.get("coa_url", ""), date=f.get("lab1", {}).get("date_str", ""),
+                        note="Microbial remediation without clear mycotoxin clearance"))
+    return out
 
 
 def _shared_id_label(p):
@@ -9092,11 +9854,18 @@ def _make_finding(category, members, severity, kind="cross-record",
     lim = next((m.get("limit") for m in members if m.get("limit") is not None), None)
     cfp0 = members[0]["cfp"]
     change_class, change_size, substantial, change_label = _classify_change(a, b, kind)
+    # Remediation layer: the SPECIFIC analyte that drove this finding (e.g. "Chromium" within the
+    # "Heavy metals" category) + its contaminant class + whether ordinary remediation could explain it.
+    _akey = a.get("analyte_key") or b.get("analyte_key") or ""
+    _aname = a.get("analyte") or b.get("analyte") or category
+    _cls = contaminant_class(_akey or category)
     return dict(
         kind=kind, category=category, severity=severity, fail_then_pass=fail_then_pass,
         relationship=_relationship(members, kind, fail_then_pass),
         change_class=change_class, change_size=change_size,
         change_substantial=substantial, change_label=change_label,
+        analyte=_aname, analyte_key=_akey,
+        contaminant_class=_cls, remediation_possible=CONTAMINANT_CLASSES[_cls]["remediation_possible"],
         timeline=timeline, note=note,
         product=cfp0.get("product", ""),
         strain=cfp0.get("strain", ""),
@@ -12827,6 +13596,22 @@ def build_patient_pdf(out_path, pin, res, analysis, report_no=None, report_dt=No
                         "available data. This does not rule out other causes for how you felt; it only reflects "
                         "what this product's testing shows.")
         story.append(Paragraph("<b>Summary:</b> " + " ".join(bits), body))
+        # TASK 9 — cross-surface the non-remediable distinction to the CONSUMER report. If THIS product's
+        # own COA carries an over-limit elemental heavy-metal or mycotoxin result, say plainly that ordinary
+        # remediation cannot remove it (a scientific fact, not an accusation).
+        _nr_hits = [r for cls_name in ("Heavy metals", "Mycotoxins")
+                    for r in analysis.get("classes", {}).get(cls_name, [])
+                    if (r.get("ct_pct") or 0) >= 100 and not r.get("below_detect")]
+        if _nr_hits:
+            _t = max(_nr_hits, key=lambda r: r.get("ct_pct") or 0)
+            story.append(Spacer(1, 3))
+            story.append(Paragraph(
+                "<b><font color='#C0392B'>Non-remediable contaminant note:</font></b> this product's COA reports "
+                f"<b>{esc(_t['name'])} at {_t['ct_pct']:.0f}% of the Connecticut limit</b>. Unlike yeast and mold, "
+                "an elemental heavy metal (or a mycotoxin) <b>cannot be removed by ordinary cannabis remediation</b> "
+                "(irradiation, ozone, RF, heat, or drying). If you ever see this product later marked as a pass, that "
+                "reversal requires a documented, itemized retest — a generic “below action limits” is not enough. "
+                "This is a lead to verify against the official COA, not a conclusion.", body))
 
     # 1) What you told us
     story.append(Paragraph("1. The product as you described it", h_st))

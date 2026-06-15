@@ -1,5 +1,6 @@
 """
-CannaScope CT V17.0.0 — Streamlit front end (consumer-friendly).
+CannaScope CT V17 — Streamlit front end (consumer-friendly). Version badge is dynamic (app_version()
+reads the real SOFTWARE_VERSION from the shipped program, so it always reflects the current release).
 
 Drives the REAL current program (auto-detected) to generate a PDF, served via st.download_button.
 ADAPTIVE: if the triple-verified COA cache is available (the self-contained CannaScope_CT_V17.py, or a

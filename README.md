@@ -2,13 +2,46 @@
 
 **Source-verified transparency reports for Connecticut cannabis — built so every number can be traced back to the product's own Certificate of Analysis (COA).**
 
-🔗 **Live web app:** [cannascope-ct.streamlit.app](https://cannascope-ct.streamlit.app) &nbsp;·&nbsp; 💻 **Desktop download:** see [Releases](../../releases) &nbsp;·&nbsp; **Current version: V17.2**
+🔗 **Live web app:** [cannascope-ct.streamlit.app](https://cannascope-ct.streamlit.app) &nbsp;·&nbsp; 💻 **Desktop download:** see [Releases](../../releases) &nbsp;·&nbsp; **Current version: V17.4**
 
 ---
 
-## 🆕 What's new in V17.2 — the credibility, completeness & polish release
+## 🆕 What's new in V17.4 — accurate, dated CT THC potency caps
 
-This is the biggest upgrade since V17. It makes the report **harder to argue with** (every record is accounted for and the math is checked), **more complete** (over-limit results can no longer hide), and **much nicer to read**.
+Connecticut **does** cap Total THC for **adult-use** sale, and the cap has **changed over time** — but the program previously declared **“no cap” for every year**. V17.4 bakes in CT's **real, dated, triple-verified** caps and shows them in the standards tables:
+
+| Product type | 2023 → Sep 30 2025 | **Oct 1 2025 →** (PA 25-166) |
+|---|---|---|
+| Flower / plant material | 30% | **35%** |
+| Concentrate / other non-vape | 60% | **70%** |
+| Vape cartridges | **exempt** | exempt |
+| Edibles | 5 mg/serving · 100 mg/package | same |
+| Medical-only / Legacy | **no cap** | no cap |
+
+- 🧪 **Triple-verified** against CGS Chapter 420h, **CT PA 21-1 (RERACA)**, **CT PA 25-166** (raised the caps eff. 2025-10-01), and **CT PA 26-8** (keeps 35% flower / drops the concentrate cap, eff. 2026-10-01 — noted, not yet applied). Shown as **VERIFIED** with citations + an as-of date.
+- ⚖️ **Correctly qualified** — caps apply to **adult-use retail sale**; **medical-only, “legacy,” and all vape cartridges are EXEMPT**; edibles use a mg dose limit, not a %. Presented as reference standards (not auto-flagged violations — the market flag is brand-level, so high-potency items may be lawfully medical-only).
+- 🧾 **Conflicting-COA tables now carry product + producer** — each Multiple / Conflicting COA comparison shows a tinted Product and Producer band, not just lab names and dates.
+
+> Detection logic is unchanged (`ANALYSIS_VERSION` stays 17.3.0); this release fixes **regulatory-reference accuracy + report identity detail**. The microbial / aerobic / pathogen / heavy-metal standards were already verified and are unchanged.
+
+---
+
+## 📦 Previously added (V17.3 — still here) — the contaminant-class remediation layer
+
+V17.3 adds a **scientific classification layer** on top of the existing fail→pass / COA-conflict detection. **The core principle:** mold, yeast, and microbes **can** be reduced or killed by validated remediation — but **chromium, lead, arsenic, cadmium, mercury cannot** (they are elemental), and neither can mycotoxins (killing the mold doesn't remove the toxin). So a **heavy-metal fail→pass is no longer treated like ordinary mold remediation** — it's surfaced as the critical scientific, regulatory, and consumer-disclosure finding it is. **This changes classification, severity, and section routing — NOT data values** (published findings are byte-identical to V17.2).
+
+- 🛑 **New "Non-Remediable Elemental Contamination — SERIOUS CONCERN" section** — every elemental heavy-metal and mycotoxin over-limit / fail→pass event with full forensics (failing value · limit on its COA · %/fold · both labs + dates · later value or "generic below action limits" · itemized? · product-type elevation · both clickable COAs · reversal), the scientific framing, and the legitimate explanations. **Never alleges fraud.**
+- 🧭 **Class-aware everywhere** — a microbial reversal reads "potential remediation/retest event"; a heavy-metal/mycotoxin reversal reads "NON-REMEDIABLE — requires documented explanation." The Labs-With-Altered-Pass/Fail table gains a Class / Interpretation column.
+- 🔎 **Transparency-failure** logic (generic "below action limits" with no itemized values), ⚗️ **Severe Chromium Exceedance** (≥ 2×) with a side-by-side view, 🍞 **mycotoxin-clearance** check after a mold remediation.
+- 🧾 **Coverage-Gap Diagnosis** — every COA held out of findings is now classified by its exact reason (OCR / broken link / multi-product routing / source mismatch / parser error / extraction), in the Coverage Integrity Summary + `coverage_gap_diagnosis.csv`.
+
+> Every flag is a **lead to verify against the official COA — never a conclusion**, and **never an allegation of fraud.**
+
+---
+
+## 📦 Previously added (V17.2 — still here) — the credibility, completeness & polish release
+
+This was the biggest upgrade since V17. It makes the report **harder to argue with** (every record is accounted for and the math is checked), **more complete** (over-limit results can no longer hide), and **much nicer to read**.
 
 ### 🛑 A PASS on the cover can no longer hide a failing line inside the COA
 Some lab reports say **"PASS / Below Action Limits" at the top**, yet a result **further down the same document is over its printed limit** (or marked FAIL). Before, CannaScope trusted the top-line PASS and those results were quarantined. **Now every analyte is judged against the limit printed on that same COA** — so an over-limit line **always surfaces** in its contaminant section, flagged **"COA Marked Pass But Contains Over-Limit Result,"** shown as a documented *internal contradiction* (the header says pass, a body line is over). It is never presented as an outside-confirmed failure — the COA's own PASS is shown right next to it.
