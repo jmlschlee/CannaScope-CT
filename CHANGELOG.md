@@ -2,7 +2,27 @@
 
 All notable changes to this project are documented here.
 
-## V17.4.0 — current release
+## V17.5.1 — 2026-06-15
+
+Correctness + evidentiary-provenance release (SOFTWARE 17.5.1 / ANALYSIS 17.3.1). Verified by a full
+forensic statewide run (2023–2026, `--validate`): 18,309 COAs, 99.9% live-verified, all gates pass.
+
+- **B-1 parser fix** — Analytics Labs "Total THC > Total Cannabinoids" inversions: the THCA label matched
+  the cannabinoid formula legend and `_bare_pct` read the "9" of "D9-THC" as THCA=9.0%, inflating derived
+  Total THC. Parser now truncates at the legend. 237 inversions → 0; 1,210 fabricated THCA values scrubbed
+  from the cache; real THCA rows preserved. Gate: THC>TotalCann < 1% of freshly-read COAs.
+- **Cache provenance (Group E)** — per-record provenance (timestamp + analysis version + source SHA-256);
+  cache-served reuse split by provenance (version-current / stale / none); version-bump invalidation;
+  online cache-audit gate; 3-state cover language; **SB-6** published-finding traceability ship-blocker;
+  `cache_provenance_audit.csv` export. No cache SCHEMA bump.
+- **Readiness (F-2 / F-4)** — per-year readiness shown as four measured criteria vs threshold (guarded so
+  evidence can't contradict the verdict); explicit, enforced 2015-isolation for post-2015 windows.
+- **Producer identity (G2)** — fixed legal-entity-as-label leak in two statewide tables (now clean trade
+  name); new in-program G2 ship-blocker. **Version drift** — cover/footer version now derived from
+  SOFTWARE_VERSION.
+- New regression suites: `_test_provenance.py`, `_test_b1_cannabinoid_legend.py`.
+
+## V17.4.0 
 
 Regulatory-standard ACCURACY release. SOFTWARE_VERSION → 17.4.0; ANALYSIS_VERSION stays 17.3.0 (no
 detection-logic / threshold / finding change — this updates the baked-in regulatory REFERENCE standards

@@ -339,6 +339,16 @@ def _read_pct(segment: str) -> Optional[float]:
 # "Total THC % (0.877*THCA)+THC" as a label, with the computed value elsewhere.
 _CANN_FORMULA = re.compile(r"0\.877|\*\s*thca|\+\s*thc|=\s*\(", re.I)
 
+# B-1 — start of the cannabinoid LEGEND / FORMULA FOOTNOTE that follows the data rows on some COAs
+# (notably Analytics Labs). Everything from here on is definitions/notes, NOT data, and must not be
+# scanned for cannabinoid values (its "D9-THC", "THCA0.877", "CBDA" tokens were being misread as data).
+# Markers are footnote-specific phrases that never appear in a data row: the spelled-out
+# detection-limit legend, the "analyzed by ..." note, and the "<cannabinoid> = ..." formula definitions.
+_CANN_LEGEND = re.compile(
+    r"analyzed\s+by\b|Limit\s+of\s+Detection|Limit\s+of\s+Quantitation|"
+    r"Total\s+A(?:ctive|vailable)\s+(?:THC|CBD|Cannabinoids?)\s*=|"
+    r"=\s*D9[\s\-]*THC|=\s*\(?\s*THCA", re.I)
+
 
 def _lodloq_result(segment: str) -> Optional[float]:
     """For a columnar 'Analyte LOD LOQ Result(%) Result(mg/g)' row, return the RESULT
@@ -386,6 +396,18 @@ def parse_cannabinoids(text: str, p) -> None:
     mreg = (re.search(r"cannabinoids?\s+results|cannabinoid\s+profile|cannabinoids?\s*\(",
                       text, re.I) or re.search(r"\bcannabinoids?\b", text, re.I))
     body = text[mreg.start(): mreg.start() + 2200] if mreg else text
+    # B-1 — DROP the cannabinoid LEGEND / FORMULA FOOTNOTE before scanning for values. Analytics Labs
+    # COAs print, AFTER the data rows, a formula legend like "Total Active THC = D9-THC + (THCA*0.877) ...
+    # Total Active Cannabinoids = THCA0.877+ d9 THC+ ..." plus "Cannabinoids analyzed by SOP / LOD =
+    # Limit of Detection ...". Those legend lines contain cannabinoid TOKENS (THCA, D9-THC, CBDA ...) next
+    # to NON-data numbers — the THCA label matched the legend and `_bare_pct` read the "9" out of
+    # "D9-THC" as THCA = 9.0%, inflating DERIVED Total THC (0.877*9 + Δ9) above Total Cannabinoids on
+    # ~237 distillate COAs (Total THC > Total Cannabinoids — impossible). All real data rows PRECEDE the
+    # legend, so cutting the body at the first legend marker fixes it without touching any real value.
+    # Safe + general: data rows never contain these legend phrases; a COA with no legend is uncut.
+    _leg = _CANN_LEGEND.search(body)
+    if _leg:
+        body = body[:_leg.start()]
     ww = bool(re.search(r"%\s*w/?\s*w|\(\s*%|w/?w\b", body, re.I)) or mreg is not None
     # Newer labs (e.g. Analytics Labs) print a columnar table:
     #   Analyte | LOD | LOQ | Result(%) | Result(mg/g)

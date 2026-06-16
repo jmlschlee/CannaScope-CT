@@ -77,12 +77,15 @@ ProductV5 = v5.ProductV5
 # ============================================================================
 # Config
 # ============================================================================
-# Version label shown on the report cover, in output filenames, and in the footer.
-APP_NAME = "CannaScope CT V17.4.0"
-# Software version as it appears in the report FILENAME standard, e.g. "13" -> "...-V15-...".
-# Bump this (and APP_NAME) on a version change; the report-number sequence keeps going (global,
-# continuous, never resets) and filenames simply carry the new version token.
-SOFTWARE_VERSION = "17.4.0"
+# Software version — appears in the report FILENAME and folder name (e.g. "...-V17.4.0-...") and on the
+# PDF cover/metadata (via APP_NAME). Bump THIS ONLY on a version change: the report number AND the
+# run-folder number RESTART at 1 for each new release (per-version sequence; see allocate_run), so a
+# fresh release begins at "#1" and the version is always in the title.
+SOFTWARE_VERSION = "17.5.1"
+# Version label shown on the report cover, in output filenames, and in the footer. DERIVED from
+# SOFTWARE_VERSION so the cover/footer can never drift from the real version (a prior bug shipped a
+# "V17.5.0" footer on a 17.5.1 build).
+APP_NAME = f"CannaScope CT V{SOFTWARE_VERSION}"
 FILE_VERSION_TAG = f"V{SOFTWARE_VERSION}"
 # Single source of truth for the actual shipped single-file name (major version only), used in EVERY
 # rendered/printed recommendation and disclaimer so the report never names a stale script (P4 fix).
@@ -326,7 +329,8 @@ SELF_IMPROVE_LOG = os.path.join(OUT_DIR, "Self-Improvement Log.json")
 # stamped AND every UNSTAMPED legacy-ledger record then becomes stale and is re-evaluated by the
 # `audit-cache` subcommand. (The existing legacy ledger is entirely unstamped, so all of it is a
 # re-eval candidate — which is exactly the pre-V16 concern: records skipped before newer logic.)
-ANALYSIS_VERSION = "17.3.0"   # BUMP on any detection-logic change (product-type guardrail, potency
+ANALYSIS_VERSION = "17.3.1"   # 17.3.1: B-1 cannabinoid field-mapping fix (Analytics legend THCA=9.0 misread)
+                              # BUMP on any detection-logic change (product-type guardrail, potency
                               # math, microbial bound handling, limit selection, self-audit categories,
                               # multi-product per-product isolation). The clean-ledger is stamped with
                               # this; entries from an OLDER analysis version are NOT trusted as clean and
@@ -437,12 +441,15 @@ def classify_coverage_gap(p):
     return ("manual_review", L["manual_review"], detail)
 
 
-def coverage_gap_diagnosis(all_results, ident=None):
+def coverage_gap_diagnosis(all_results, ident=None, extra_source_mismatch=0):
     """Aggregate per-COA coverage-gap reasons across the run. Returns (reasons, rows):
       reasons = [{code, label, count}, ...]  (descending by count) — the summary table.
       rows    = [{product, producer, type, test_date, coa_status, reason_code, reason_label,
                   detail, reg, report_url}, ...] — the full per-COA CSV. A 'gap' COA is any whose
-      _coa_status is NOT in PUBLISHABLE (held out of findings). Pure read; never re-fetches."""
+      _coa_status is NOT in PUBLISHABLE (held out of findings). Pure read; never re-fetches.
+      A-3: `extra_source_mismatch` folds the publish-path source-binding audit exclusions (publishable
+      rows whose value could not be re-verified) into the 'source_mismatch' reason, so this diagnosis and
+      the held-out source-mismatch bucket report the SAME single integer."""
     from collections import Counter as _C
     counts = _C()
     rows = []
@@ -461,6 +468,8 @@ def coverage_gap_diagnosis(all_results, ident=None):
             coa_status=getattr(p, "_coa_status", "") or "", reason_code=code, reason_label=label,
             detail=detail[:200], reg=getattr(p, "registration_number", "") or "",
             report_url=getattr(p, "report_url", "") or ""))
+    if extra_source_mismatch:
+        counts["source_mismatch"] += int(extra_source_mismatch)
     reasons = [dict(code=c, label=GAP_REASON_LABELS.get(c, c), count=n)
                for c, n in counts.most_common()]
     return reasons, rows
@@ -749,6 +758,44 @@ def _seed_embedded_coa_cache():
         pass
 
 
+_TC_IN_NAME_RX = re.compile(r"\s*\b(?:Tc|TC)\s*\d+(?:\.\d+)?\s*%", re.I)
+
+
+def clean_product_name(s):
+    """C-1: strip an embedded Total-Cannabinoids token ('TC 25.337%') that some producers (e.g. Curaleaf)
+    bake into the registry product name — it bled into the Product name cell and duplicated the Total
+    Cannabinoids column. The program reads Total Cannabinoids from the COA, NEVER from the name, so removing
+    it is lossless. Leaves the SKU/lot number (which follows the token) intact."""
+    if not s:
+        return s
+    out = _TC_IN_NAME_RX.sub(" ", s)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+def _short_url(u, maxlen=46):
+    """C-0: a DISPLAY-only URL that fits its table cell (no margin overflow). Long URLs are middle-elided
+    ('domain/…/last-segment'); the FULL url is preserved verbatim in the machine-readable reg-ledger export
+    (CT Regulatory Ledger.json) and the source-document CSVs, so provenance is not lost. ReportLab does not
+    reliably break long unbroken tokens, so truncation is the robust, copy-clean fix."""
+    u = (u or "").strip()
+    if len(u) <= maxlen:
+        return u
+    m = re.match(r'^(https?://[^/]+)(/.*)?$', u)
+    if m:
+        host = m.group(1); rest = m.group(2) or ""
+        tail = rest[-(maxlen - len(host) - 2):] if rest else ""
+        return f"{host}/…{tail}" if tail else host
+    return u[: maxlen - 1] + "…"
+
+
+def _normalize_product_names(products):
+    for p in products:
+        nm = clean_product_name(getattr(p, "product_name", "") or "")
+        if nm != getattr(p, "product_name", ""):
+            p.product_name = nm
+    return products
+
+
 def load_registry(session, refresh=False, offline=False):
     v5.OUT_DIR = OUT_DIR
     v5.REGISTRY_CACHE = REGISTRY_CACHE
@@ -764,9 +811,9 @@ def load_registry(session, refresh=False, offline=False):
         with open(REGISTRY_CACHE, encoding="utf-8", errors="replace") as f:
             products = v5._rows_from_csv_text(f.read())
         print(f"Registry: OFFLINE — using bundled cache ({len(products)} products, age ignored).")
-        return products
+        return _normalize_product_names(products)   # C-1
     try:
-        return v5.load_registry(session, refresh=refresh)
+        return _normalize_product_names(v5.load_registry(session, refresh=refresh))   # C-1
     except Exception as e:
         # Resilience: if the live download fails, fall back to the cached/embedded snapshot
         # rather than aborting. (Only used when the network/source is unavailable — there is
@@ -775,7 +822,7 @@ def load_registry(session, refresh=False, offline=False):
             print(f"Registry: live download failed ({type(e).__name__}); using the "
                   "cached/embedded snapshot instead.")
             with open(REGISTRY_CACHE, encoding="utf-8", errors="replace") as f:
-                return v5._rows_from_csv_text(f.read())
+                return _normalize_product_names(v5._rows_from_csv_text(f.read()))   # C-1
         raise
 
 
@@ -1064,6 +1111,38 @@ class Identity:
         self.cache[key] = rec
         return rec
 
+    def canonical(self, legal):
+        """V17.5.0 canonical producer record — the THREE identity levels stored SEPARATELY, never
+        concatenated. `producer_id` is the stable join key (NOT a display string), so findings/counts/
+        rankings join on it (this is what stops the swapped-name double-listing). `trade_name` is the
+        single primary display label (no parenthetical smoosh, no LLC). `dba_brands` is a list, never
+        folded into the other levels. Unknown LLC -> None (rendered '— (unverified)', never guessed)."""
+        r = self.resolve(legal)
+        pid = _norm(legal) or "_unknown_"
+        legal_llc = (r.get("legal") or tcase(legal or "")).strip() or None
+        # trade_name: resolve()['common'] already falls back to the top registry brand; if even that is
+        # empty, use the legal entity name (a real registry value, not a fabrication). NEVER a smoosh.
+        trade = (r.get("common") or "").strip() or (legal_llc or "(unverified)")
+        # Drop a trailing corporate suffix from the DISPLAY trade name ("Rodeo Cannabis Co." -> "Rodeo
+        # Cannabis") so findings rows never carry an LLC/Co./Inc./Corp. token (G2). The legal entity is
+        # preserved separately in legal_entity_llc for the appendix.
+        _t2 = re.sub(r"[\s,]+(Co\.?|L\.?L\.?C\.?|Inc\.?|Corp\.?)\s*$", "", trade, flags=re.I).strip()
+        trade = _t2 or trade
+        return dict(producer_id=pid, legal_entity_llc=legal_llc, trade_name=trade,
+                    dba_brands=list(r.get("brands") or []),
+                    identity_confidence=int(r.get("confidence", 0) or 0),
+                    identity_source=(r.get("source", "") or ""))
+
+    def canonical_records(self):
+        """Every distinct producer resolved this run as canonical records (for the appendix, the
+        collision audit, and producers_canonical.json). De-duplicated by producer_id."""
+        out = {}
+        for rec in list(self.cache.values()):
+            legal = rec.get("legal", "")
+            c = self.canonical(legal)
+            out[c["producer_id"]] = c
+        return list(out.values())
+
     def _lookup(self, legal, key):
         legal_disp = tcase(legal)
         overlay = IDENTITY_OVERLAY.get(key)
@@ -1151,30 +1230,16 @@ def lab_name(p, lmap):
 
 
 def producer_short(p, ident):
-    """Concise findings-table producer name: 'Common (PrimaryBrand)', or just the
-    common name when the brand is the same / absent. Legal entity is NOT shown here
-    (it lives in the appendix). E.g. 'Fine Fettle (Comffy)', 'Brix Cannabis',
-    'Rodeo Cannabis', 'Advanced Grow Labs (Good Green)'."""
-    r = ident.resolve(p.producer)
-    common = r["common"] or tcase(p.producer)
-    common = re.sub(r"\s+Co\.?$", "", common).strip()         # 'Rodeo Cannabis Co.' -> 'Rodeo Cannabis'
-    cl = common.lower()
-    brand = (p.brand or "").strip()
-    if not brand:
-        brand = next((b for b in r["brands"] if b.lower() not in cl and cl not in b.lower()), "")
-    if brand and brand.lower() not in cl and cl not in brand.lower():
-        return f"{common} ({brand})"
-    return common
+    """V17.5.0: the CLEAN trade-name label for findings / ranking / snapshot tables — trade name ONLY,
+    no '(Brand)' parenthetical smoosh and no LLC. The full Legal Entity -> Trade Name -> DBA/Brand(s)
+    chain is shown (un-flattened) only in the Producer Identity appendix. Was 'Common (PrimaryBrand)'."""
+    return ident.canonical(p.producer)["trade_name"]
 
 
 def producer_label_short(legal, ident):
-    """Producer-level concise label 'Common (PrimaryBrand)' for trend tables
-    (legal entity lives in the appendix)."""
-    r = ident.resolve(legal)
-    common = re.sub(r"\s+Co\.?$", "", (r["common"] or tcase(legal))).strip()
-    cl = common.lower()
-    brand = next((b for b in r["brands"] if b.lower() not in cl and cl not in b.lower()), "")
-    return f"{common} ({brand})" if brand else common
+    """V17.5.0: CLEAN trade-name label for trend/ranking grouping display — trade name only, no smoosh.
+    (Grouping JOINS on producer_id, not on this string; this is display only.)"""
+    return ident.canonical(legal)["trade_name"]
 
 
 # ---- Consumer-report helpers (PATIENT/CONSUMER PDF ONLY; not used by the statewide report) ----
@@ -2112,6 +2177,12 @@ def _require_live_violations(debug):
     cas = str(debug.get("cache_audit_status", "") or "")
     if cas.startswith("skipped"):
         v.append(f"CACHE AUDIT bypassed ({cas})")
+    # SB-6 — a forensic/validated report cannot publish a finding that has no recorded live-verification
+    # event (live this run or version-current provenance on file). Any such finding aborts publication.
+    _np = int(debug.get("published_findings_without_provenance", 0) or 0)
+    if _np > 0:
+        v.append(f"SB-6 TRACEABILITY: {_np} published finding(s) with no provenance-backed live "
+                 "verification (see Data Exports/cache_provenance_audit.csv)")
     return v
 
 
@@ -2254,10 +2325,61 @@ def _hold_incomplete(p, plausible, missing):
         p._coa_status = MATCH_MANUAL
 
 
+# ── E-2 PER-RECORD CACHE PROVENANCE ──────────────────────────────────────────────────────────────
+# Every write through _cache_put_v15 is a FRESH LIVE READ (it is only ever called right after a live
+# process_product). So each persisted row records WHEN it was live-verified, under WHICH analysis
+# version, and the SHA-256 of the source COA bytes it was read from. These ride inside the cache's
+# `_extra` JSON (restored via setattr on rehydrate) — NO coa_csv_cache SCHEMA bump, so the 33k embedded
+# rows are NOT invalidated; they simply carry no provenance (correctly classified "no provenance on
+# file → must re-verify or hold"). This is the evidentiary backbone for E-3/E-4/E-5/SB-6.
+PROVENANCE_KEYS = ("_last_live_verified_at", "_verified_analysis_version", "_source_sha256")
+
+
+def _now_stamp():
+    """Local timezone-aware wall-clock stamp for provenance records (matches the cache's _now())."""
+    return datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _file_sha256(path):
+    """SHA-256 of a file's raw bytes, or "" if unreadable. Tamper-evident source provenance."""
+    if not path:
+        return ""
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _provenance_current(p):
+    """True iff this (rehydrated) product carries a live-verification stamp written under the CURRENT
+    ANALYSIS_VERSION — i.e. a value verified in this OR a prior run whose provenance is on file and is
+    not version-stale. The decision rule for trusting reused-from-cache values (E-3/E-4/SB-6)."""
+    return bool(getattr(p, "_last_live_verified_at", "")) and \
+        str(getattr(p, "_verified_analysis_version", "")) == ANALYSIS_VERSION
+
+
+def _provenance_state(p):
+    """One of: 'live' (live-verified THIS run), 'prior' (provenance on file, version-current, reused),
+    'stale' (provenance on file but written under an OLDER analysis version → must re-verify),
+    'none' (no live-verification provenance on file). Used for the 3-state cover language (E-5)."""
+    if getattr(p, "_online_refetched", False):
+        return "live"
+    if getattr(p, "_last_live_verified_at", ""):
+        return "prior" if str(getattr(p, "_verified_analysis_version", "")) == ANALYSIS_VERSION else "stale"
+    return "none"
+
+
 def _cache_put_v15(cache, p, method="v15"):
     """Persist a freshly-read product's measurements + report-fidelity extras + multi-product block
-    binding, so a rehydrated record's source audit re-verifies against its OWN matched block."""
-    cache.put(p, method=method, text_len=0, pdf_path=v4.cache_path(p),
+    binding, so a rehydrated record's source audit re-verifies against its OWN matched block. Stamps
+    E-2 live-verification provenance (timestamp + analysis version + source SHA-256) onto the row."""
+    _pdf = v4.cache_path(p)
+    cache.put(p, method=method, text_len=0, pdf_path=_pdf,
               extra={"testing_date": getattr(p, "testing_date", "") or test_date(p),
                      "_coa_status": getattr(p, "_coa_status", "") or "",
                      "_coa_block_id": getattr(p, "_coa_block_id", "") or "",
@@ -2266,7 +2388,11 @@ def _cache_put_v15(cache, p, method="v15"):
                      "_multi_product_isolated": bool(getattr(p, "_multi_product_isolated", False)),
                      # persisted so a cache HIT can detect a printed-but-unparsed safety panel
                      # without re-reading the COA text (the false-clean guard, Phase-1.5).
-                     "_missing_safety_panels": list(getattr(p, "_missing_safety_panels", []) or [])})
+                     "_missing_safety_panels": list(getattr(p, "_missing_safety_panels", []) or []),
+                     # E-2 provenance — recorded on every live write (this IS a fresh live read).
+                     "_last_live_verified_at": _now_stamp(),
+                     "_verified_analysis_version": ANALYSIS_VERSION,
+                     "_source_sha256": _file_sha256(_pdf)})
 
 
 def cached_or_v15(p, session, watch, cache, allow_network=True, force_live=False, live_first=True):
@@ -2316,8 +2442,15 @@ def cached_or_v15(p, session, watch, cache, allow_network=True, force_live=False
             # publish a doubtful cached value as a confident clean.
             plausible, why = _measurements_plausible(rp)
             missing = list(getattr(rp, "_missing_safety_panels", None) or [])
-            if plausible and not missing:
-                return rp                            # trusted HIT: plausible AND complete
+            # E-4 VERSION-BUMP INVALIDATION — a cached row stamped with live-verification provenance under a
+            # SUPERSEDED analysis version (state == "stale") is no longer trusted blindly: when online we
+            # re-pull it live (re-verify under the current version), exactly as a doubtful row. Offline we
+            # keep it (the report is non-authoritative there anyway). Rows with NO provenance ("none") are
+            # NOT force-re-read here — the run-level cache self-audit samples them and --validate cold-reads
+            # the whole window; forcing every no-provenance row live each run would defeat the speed cache.
+            _stale_prov = (_provenance_state(rp) == "stale") and (allow_network and ONLINE_OCR_FALLBACK)
+            if plausible and not missing and not _stale_prov:
+                return rp                            # trusted HIT: plausible, complete, provenance-current
             if not (allow_network and ONLINE_OCR_FALLBACK):
                 _hold_incomplete(rp, plausible, missing)   # offline/fallback-off: hold, don't trust
                 return rp
@@ -3188,8 +3321,9 @@ LEGAL_SOURCES = {
     "thc_potency": [
         ("CT General Statutes — Chapter 420h (adult-use cannabis; THC potency caps)",
          "https://www.cga.ct.gov/current/pub/chap_420h.htm"),
-        ("CT PA 25-166 — flower 30%→35%, concentrate/other 60%→70% (eff. 2025-10-01)",
-         "https://www.cga.ct.gov/2025/ACT/PA/PDF/2025PA-00166-R00SB-01445-PA.PDF"),
+        ("CT PA 25-166 (amends CGS Ch. 420h) — flower 30%→35%, concentrate/other 60%→70% (eff. 2025-10-01); "
+         "codified text at chap_420h",
+         "https://www.cga.ct.gov/current/pub/chap_420h.htm"),
         ("CT PA 26-8 (HB 5350) — keeps 35% flower, drops concentrate cap (eff. 2026-10-01)",
          "https://www.cga.ct.gov/2026/ACT/PA/PDF/2026PA-00008-R00HB-05350-PA.PDF"),
     ],
@@ -4257,7 +4391,47 @@ def _provenance_self_checks(debug):
     row(f"PROVENANCE: live verification coverage {reval}/{reviewed} ({vc}%) — zero live verification while online",
         online and reviewed > 0 and vc == 0,
         passed=f"PROVENANCE: live verification performed — {reval}/{reviewed} ({vc}%) re-verified live this run")
+    # E-1 GATE — on an ONLINE, cache-enabled run the cache self-audit MUST actually live-audit cached COAs.
+    # `cache_audit_eligible` counts cached rows with usable measurements in the scan set; if any exist and
+    # the run is online with the csv cache active, `cache_audit_sampled_live` must be > 0 (the audit ran).
+    # Sampled==0 with eligible>0 means the audit silently did not execute — the exact symptom this catches.
+    _cache_enabled_audit = cas in ("cache verified vs live", "DISTRUSTED->full live re-pull")
+    _audit_eligible = int(debug.get("cache_audit_eligible", 0) or 0)
+    _audit_sampled = int(debug.get("cache_audit_sampled_live", 0) or 0)
+    row(f"PROVENANCE: cache-enabled online run did NOT live-audit any cached COA "
+        f"(eligible={_audit_eligible}, sampled live=0)",
+        online and _cache_enabled_audit and _audit_eligible > 0 and _audit_sampled == 0,
+        passed=f"PROVENANCE: cache self-audit ran live — {_audit_sampled} of {_audit_eligible} cached COAs "
+               "re-pulled + compared against their live source this run")
+    # SB-6 GATE — published findings must trace to a recorded live-verification event. REMAINS when any
+    # published finding lacks provenance-backed live verification (blocks under --strict-audit / --validate;
+    # the forensic --validate run also hard-aborts via _require_live_violations).
+    _pub_total = int(debug.get("published_findings_total", 0) or 0)
+    _pub_noprov = int(debug.get("published_findings_without_provenance", 0) or 0)
+    row(f"SB-6 TRACEABILITY: {_pub_noprov} of {_pub_total} published finding(s) lack a provenance-backed "
+        "live verification (no live-verification record on file)", _pub_noprov > 0,
+        passed=f"SB-6 TRACEABILITY: all {_pub_total} published finding(s) trace to a live-verification event "
+               "(live this run or version-current provenance on file)")
+    # B-1 GATE — THC>TotalCannabinoids parser-conflict rate must stay under 1% of FRESHLY-READ (live) COAs.
+    # The Analytics-legend THCA=9.0 misread inflated derived Total THC above Total Cannabinoids on ~237
+    # distillates; after the parse fix this should be ~0. Gated on a meaningful live sample (>=50 freshly
+    # read) so an OFFLINE cache-replay — whose stale cache still holds the pre-fix values — does not trip a
+    # PARSER gate; those stale rows are a cache-rebuild concern, disclosed separately, not a fresh failure.
+    _fresh = int(debug.get("products_freshly_read_live", 0) or 0)
+    _thc_inv = int(debug.get("thc_over_total_cannabinoids_conflicts", 0) or 0)
+    _b1_rate = (100.0 * _thc_inv / _fresh) if _fresh else 0.0
+    row(f"B-1 PARSER: Total THC > Total Cannabinoids on {_thc_inv} of {_fresh} freshly-read COAs "
+        f"({_b1_rate:.1f}%) — exceeds the 1% gate (cannabinoid field-mapping regression)",
+        _fresh >= 50 and _thc_inv > 0.01 * _fresh,
+        passed=(f"B-1 PARSER: Total THC > Total Cannabinoids on {_thc_inv} of {_fresh} freshly-read COAs "
+                f"({_b1_rate:.1f}%) — within the 1% gate" if _fresh >= 50
+                else "B-1 PARSER: THC>TotalCannabinoids gate not exercised (no meaningful live sample this run)"))
     # Informational provenance coverage (always shown; not a failure on its own):
+    _pb = int(debug.get("cache_served_provenance_backed", 0) or 0)
+    _ps = int(debug.get("cache_served_stale_version", 0) or 0)
+    _pn = int(debug.get("cache_served_no_provenance", 0) or 0)
+    out.append(dict(issue=f"PROVENANCE (info): cache-served reuse — {_pb} version-current provenance, "
+                          f"{_ps} stale-version, {_pn} no-provenance (E-3)", count=0, status="None"))
     out.append(dict(issue=f"PROVENANCE (info): fresh OCR successes this run = {ocr}", count=0, status="None"))
     out.append(dict(issue=f"PROVENANCE (info): validation coverage = {vc}% ({reval}/{reviewed} re-verified live)",
                     count=0, status="None"))
@@ -4318,11 +4492,14 @@ def _report_dirs():
     return [OUT_DIR, os.path.dirname(os.path.abspath(OUT_DIR)), PATIENT_OUT_DIR]
 
 
-def report_filename(report_no, report_type, dt=None):
-    """Short, browse-friendly name: {N}-CannaScopeCT-{SW|CC}-{M.D.YY}-{TIME}.pdf
-    e.g. 34-CannaScopeCT-SW-6.5.26-1202PM.pdf — number first (primary id), no version token, no
-    zero-padded/4-digit date, no colon in the time. Full detail stays INSIDE the PDF (cover+footer)."""
-    return f"{report_no}-CannaScopeCT-{_TYPE_TAG.get(report_type, 'SW')}-{_date_compact(dt)}-{_time_compact(dt)}.pdf"
+def report_filename(report_no, report_type, dt=None, version=None):
+    """Browse-friendly name: {N}-CannaScopeCT-V{VERSION}-{SW|CC}-{M.D.YY}-{TIME}.pdf
+    e.g. 1-CannaScopeCT-V17.4.0-SW-6.15.26-434PM.pdf. The report NUMBER restarts at 1 with EACH software
+    VERSION (per-version sequence), and the VERSION is in the filename — so the title shows the version and
+    per-version #1 files never collide across releases. `_REPORT_NUM_RX` still matches the leading number."""
+    ver = (version or SOFTWARE_VERSION)
+    return (f"{report_no}-CannaScopeCT-V{ver}-{_TYPE_TAG.get(report_type, 'SW')}-"
+            f"{_date_compact(dt)}-{_time_compact(dt)}.pdf")
 
 
 def _load_report_registry():
@@ -4345,11 +4522,13 @@ def _save_report_registry(d):
         pass
 
 
-def _disk_max_report_number():
-    """Highest report number anywhere on disk (both types; base folders AND their run subfolders;
-    short + legacy names). 0 if none. Used to reconcile the registry so a number is never reused."""
+def _disk_max_report_number(version=None):
+    """Highest report number on disk. When `version` is given, count ONLY that version's files (name
+    contains "-V{version}-") so the per-version sequence restarts at 1 for a fresh release and never
+    reuses a number WITHIN a version. 0 if none."""
     import glob
     nums = [0]
+    vtok = (f"-v{version}-".lower() if version else None)
     recursive = {OUT_DIR, PATIENT_OUT_DIR}      # run folders live exactly one level under these
     for d in set(_report_dirs()):
         pats = [os.path.join(d, "*.pdf")]
@@ -4357,30 +4536,42 @@ def _disk_max_report_number():
             pats.append(os.path.join(d, "*", "*.pdf"))   # one level deep = per-run folders
         for pat in pats:
             for f in glob.glob(pat):
-                m = _REPORT_NUM_RX.match(os.path.basename(f)) or _LEGACY_NUM_RX.search(os.path.basename(f))
+                base = os.path.basename(f)
+                if vtok and vtok not in base.lower():    # version-scoped: skip other versions' files
+                    continue
+                m = _REPORT_NUM_RX.match(base) or _LEGACY_NUM_RX.search(base)
                 if m:
                     nums.append(int(m.group(1)))
     return max(nums)
 
 
-def _disk_max_folder_number(report_type):
-    """Highest existing run-folder number for this report type on disk. 0 if none."""
+def _disk_max_folder_number(report_type, version=None):
+    """Highest run-folder number for this report type on disk. When `version` is given, count ONLY this
+    version's folders (name contains " V{version} ") so the per-version folder sequence restarts at 1 for
+    a fresh release. 0 if none."""
     import glob
     label = _FOLDER_LABEL[report_type]
     base = OUT_DIR if report_type == REPORT_TYPE_STATEWIDE else PATIENT_OUT_DIR
     nums = [0]
+    vtok = (f" v{version} ".lower() if version else None)
     for p in glob.glob(os.path.join(base, f"* {label} *")):
         if os.path.isdir(p):
-            m = re.match(r"^(\d+)\s", os.path.basename(p))
+            bn = os.path.basename(p)
+            if vtok and vtok not in f" {bn} ".lower():   # version-scoped: skip other versions' folders
+                continue
+            m = re.match(r"^(\d+)\s", bn)
             if m:
                 nums.append(int(m.group(1)))
     return max(nums)
 
 
 def next_global_report_number():
-    """Next global report number, reconciled across the persistent registry and disk."""
+    """Next report number for the CURRENT software version — restarts at 1 on each new release.
+    Reconciled across the persistent registry and disk (both version-scoped)."""
     reg = _load_report_registry()
-    return max(reg.get("next_report_number", 1), _disk_max_report_number() + 1)
+    ver = SOFTWARE_VERSION
+    vr = reg.get("version_report_numbers", {})
+    return max(int(vr.get(ver, 1)), _disk_max_report_number(version=ver) + 1)
 
 
 def allocate_run(report_type, dt=None):
@@ -4389,22 +4580,28 @@ def allocate_run(report_type, dt=None):
     run folder; point RUN_OUT_DIR at it; persist the advanced counters. Returns (report_no, run_folder, dt)."""
     global RUN_OUT_DIR
     dt = dt or datetime.datetime.now().astimezone()   # tz-aware so the PDF cover's %Z renders
+    ver = SOFTWARE_VERSION
     reg = _load_report_registry()
-    report_no = max(reg.get("next_report_number", 1), _disk_max_report_number() + 1)
-    fkey = ("next_statewide_folder_number" if report_type == REPORT_TYPE_STATEWIDE
-            else "next_consumer_concern_folder_number")
-    folder_no = max(reg.get(fkey, 1), _disk_max_folder_number(report_type) + 1)
+    # PER-VERSION numbering: the report number AND the folder number restart at 1 with each software
+    # release, reconciled against disk (version-scoped) so a number is never reused WITHIN a version and
+    # per-version #1 never collides across releases (the version is in both the filename and folder name).
+    vr = reg.setdefault("version_report_numbers", {})
+    report_no = max(int(vr.get(ver, 1)), _disk_max_report_number(version=ver) + 1)
+    fkey = ("version_statewide_folder_numbers" if report_type == REPORT_TYPE_STATEWIDE
+            else "version_consumer_concern_folder_numbers")
+    vf = reg.setdefault(fkey, {})
+    folder_no = max(int(vf.get(ver, 1)), _disk_max_folder_number(report_type, version=ver) + 1)
     base = OUT_DIR if report_type == REPORT_TYPE_STATEWIDE else PATIENT_OUT_DIR
     label = _FOLDER_LABEL[report_type]
     os.makedirs(base, exist_ok=True)
     while True:   # never write into / overwrite an existing folder — advance to the next free number
-        run_folder = os.path.join(base, f"{folder_no} {label} {_date_compact(dt)}")
+        run_folder = os.path.join(base, f"{folder_no} {label} V{ver} {_date_compact(dt)}")
         if not os.path.exists(run_folder):
             break
         folder_no += 1
     os.makedirs(run_folder)            # exist_ok defaults False -> guaranteed brand-new folder
-    reg["next_report_number"] = report_no + 1
-    reg[fkey] = folder_no + 1
+    vr[ver] = report_no + 1
+    vf[ver] = folder_no + 1
     _save_report_registry(reg)
     RUN_OUT_DIR = run_folder
     return report_no, run_folder, dt
@@ -4672,7 +4869,9 @@ def analyze_convenience_groupings(all_results, ident, lmap):
             round_cluster = _cg_round_cluster(rs)
             low_n = n < CG_MIN_N
             score = _cg_convenience_score(near, n, over, ratio, pval, z, round_cluster, low_n)
-            dates = sorted(r["date"] for r in rs if r["date"])
+            # C-5: sort CHRONOLOGICALLY (parse_date tuple), not lexicographically — string sort put
+            # "1/13/2026" before "9/9/2025" and printed a REVERSED "min to max" range. Now date_lo<=date_hi.
+            dates = sorted((r["date"] for r in rs if r["date"]), key=lambda s: v4.parse_date(s))
             grp_out.append(dict(
                 producer=prod, lab=lab, analyte=disp, unit=unit, limit=limit, program=prog,
                 total=n, near=near, over=over, obs_rate=obs_rate, exp_near=exp, ratio=ratio,
@@ -4691,6 +4890,91 @@ def analyze_convenience_groupings(all_results, ident, lmap):
                                 bands=bands, sw_near=sw_near, sw_over=sw_over, sw_rate=sw_rate,
                                 groups=grp_out, records=recs)
     return per_analyte
+
+
+def _post_render_audit(out_path):
+    """C-4/SB-4 (glyph coverage) + C-0/SB-5 (no text overflow) audit on the RENDERED PDF. Writes
+    glyph_coverage_audit.csv + layout_overflow_audit.csv to Data Exports. Aborts (sys.exit) on a genuine
+    tofu glyph (a codepoint with no embedded glyph) or real content-area horizontal overflow — header/footer
+    bands are excluded (they intentionally sit in the page margin). Best-effort: if PyMuPDF is unavailable
+    the audit is SKIPPED and that is stated (the embedded-font + _fit_widths guarantees still apply)."""
+    try:
+        import fitz
+    except Exception:
+        print("  RENDER AUDIT: skipped (PyMuPDF unavailable) — relying on embedded fonts + _fit_widths caps.")
+        return
+    import unicodedata as _ud, csv as _csv, collections as _c
+    exp = os.path.join(os.path.dirname(out_path), _EXPORTS_SUBDIR)
+    os.makedirs(exp, exist_ok=True)
+    doc = fitz.open(out_path)
+    cp = _c.Counter(); tofu = 0
+    for pg in doc:
+        t = pg.get_text()
+        tofu += t.count("�")
+        for ch in t:
+            if ord(ch) > 127:
+                cp[ch] += 1
+    with open(os.path.join(exp, "glyph_coverage_audit.csv"), "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f); w.writerow(["codepoint", "name", "count", "renders_ok"])
+        for ch, n in sorted(cp.items()):
+            w.writerow([f"U+{ord(ch):04X}", _ud.name(ch, "?"), n, "yes"])
+        w.writerow(["U+FFFD", "REPLACEMENT CHARACTER (tofu)", tofu, "no" if tofu else "n/a"])
+    BAND = 30                       # exclude top/bottom 30pt header/footer band (intentionally near edge)
+    RM = 0.3 * 72 - 1               # left/right content margin in pt (0.3in), 1pt slack
+    margin_incursion = []           # past the content margin but still ON the page (e.g. a long URL) -> WARN
+    offpage = []                    # off the physical page = true clipping -> ABORT (SB-5)
+    for pg in doc:
+        r = pg.rect; right_edge = r.width - RM
+        for b in pg.get_text("blocks"):
+            x0, y0, x1, y1 = b[0], b[1], b[2], b[3]
+            if y0 < BAND or y1 > r.height - BAND:
+                continue
+            row = [pg.number + 1, round(x0, 1), round(x1, 1), round(right_edge, 1),
+                   (b[4] or "").strip().replace("\n", " ")[:60]]
+            if x1 > r.width - 1 or x0 < 1:                      # off the physical page = clipped
+                offpage.append(row)
+            elif x1 > right_edge + 2 or x0 < RM - 2:            # into the margin band only
+                margin_incursion.append(row + ["margin-incursion"])
+    with open(os.path.join(exp, "layout_overflow_audit.csv"), "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f); w.writerow(["page", "x0", "x1", "content_right_edge", "text_sample", "severity"])
+        for row in offpage:
+            w.writerow(row + ["OFF-PAGE (clipped)"])
+        for row in margin_incursion:
+            w.writerow(row)
+    print(f"  RENDER AUDIT: glyphs {len(cp)} distinct non-ASCII, tofu={tofu}; off-page blocks={len(offpage)}; "
+          f"margin-incursions={len(margin_incursion)} (header/footer excluded; detail in layout_overflow_audit.csv).")
+    if tofu:
+        print("\n" + "=" * 74)
+        print(f"  SB-4 SHIP-BLOCKER: {tofu} tofu glyph(s) (U+FFFD) in the rendered PDF — a codepoint has no "
+              "embedded glyph. ABORT — see Data Exports/glyph_coverage_audit.csv.")
+        print("=" * 74); sys.exit(2)
+    if offpage:
+        print("\n" + "=" * 74)
+        print(f"  SB-5 SHIP-BLOCKER: {len(offpage)} text block(s) clip OFF the page edge — e.g. {offpage[0]}. "
+              "ABORT — see Data Exports/layout_overflow_audit.csv.")
+        print("=" * 74); sys.exit(2)
+    if margin_incursion:
+        print(f"  NOTE (C-0): {len(margin_incursion)} block(s) extend into the 0.3in margin band (on-page, not "
+              "clipped) — typically an unbreakable long URL; logged for review, not a ship-blocker.")
+    # G2 SHIP-BLOCKER (producer identity) — no legal entity used as a producer LABEL parenthetical
+    # ("X LLC (Brand)") anywhere in the report BODY. Findings/ranking rows must carry the clean trade name
+    # (producer_label_short); the full Legal-Entity → Trade-Name → DBA chain belongs ONLY in the Producer
+    # Identity appendix. Mirrors the external acceptance gate (_gates_identity.py G2) so the build can never
+    # silently ship the defect again (a prior build leaked "DXR Finance 3, LLC (Theraplant …)" via a
+    # consumer-only formatter used in a statewide table). Appendix lines are excluded by marker.
+    import re as _re2
+    _g2_appendix = ("Legal Entity (LLC)", "IDENTITY COLLISION", "Chain A", "Chain B")
+    _g2_bad = []
+    for pg in doc:
+        for ln in pg.get_text().splitlines():
+            if _re2.search(r"(LLC|Inc\.|Corp\.|Co\.)\s*\(", ln) and not any(t in ln for t in _g2_appendix):
+                _g2_bad.append((pg.number + 1, ln.strip()[:90]))
+    if _g2_bad:
+        print("\n" + "=" * 74)
+        print(f"  G2 SHIP-BLOCKER: {len(_g2_bad)} body line(s) render a legal entity (LLC/Inc./Corp./Co.) as a "
+              f"producer LABEL — e.g. p{_g2_bad[0][0]}: '{_g2_bad[0][1]}'. Findings/ranking rows must use the "
+              "clean trade name; the identity chain belongs only in the Producer Identity appendix. ABORT.")
+        print("=" * 74); sys.exit(2)
 
 
 def build_pdf(out_path, report_no, ctx):
@@ -4738,6 +5022,10 @@ def build_pdf(out_path, report_no, ctx):
     # word ("Confidence" -> "Confidenc"/"e"). Children (cellc/cellb/cellr/...) inherit this; long
     # tokens now stay whole (and we size columns / abbreviate headers so they fit).
     cell = ParagraphStyle("c", fontName=BF, fontSize=11, leading=14, splitLongWords=0)
+    # C-0: URL cells force-break a long unbreakable URL at the cell edge (splitLongWords=1) so it wraps
+    # inside its column instead of extending into the page margin. No characters are inserted, so the
+    # copy/paste text layer keeps the URL intact (unlike a zero-width-space approach).
+    urlcell = ParagraphStyle("urlc", parent=cell, fontSize=8.5, leading=11, splitLongWords=1, wordWrap="CJK")
     cellc = ParagraphStyle("cc", parent=cell, alignment=1)
     cellb = ParagraphStyle("cb", parent=cell, fontName=BFB)
     # Right-aligned numeric cells: measured values, limits, %-of-limit and differences read far
@@ -5093,7 +5381,7 @@ def build_pdf(out_path, report_no, ctx):
         # object (no inline "remaining %" recompute): the buckets named here SUM to 100% of the window, and
         # the remainder is attributed to its REAL cause (out-of-window / not-verified / prior-run reuse),
         # exactly matching the Reconciled Verification Breakdown + Date-Window Integrity sections.
-        (lambda _a: Paragraph(_scope_sentence(_a),
+        (lambda _a: Paragraph(_scope_sentence(_a, ctx.get("debug") or {}),
             ParagraphStyle("scopecap", parent=meta_st, fontSize=9, leading=12, textColor=colors.HexColor("#5a5a5a")))
          )(ctx["acct"]) if ctx.get("acct") else Spacer(0, 0),
         Paragraph(f"Created {esc(cover_date)}", meta_st),
@@ -5147,8 +5435,10 @@ def build_pdf(out_path, report_no, ctx):
              f'(<b>{_d.get("validation_coverage_pct", 0.0)}%</b>) &mdash; '
              f'{_d.get("products_freshly_read_live", 0):,} freshly read live (cold read) + '
              f'{_d.get("products_revalidated_live", 0):,} cache-audit re-pulls &nbsp;•&nbsp; '
-             f'{_d.get("products_served_from_cache_unverified", 0):,} not verified live this run '
-             "(cache-served / unreadable) &nbsp;•&nbsp; "
+             f'{_d.get("products_served_from_cache_unverified", 0):,} not live-verified this run '
+             f'(of which {_d.get("cache_served_provenance_backed", 0):,} reused with a version-current '
+             f'verification on file, {_d.get("cache_served_stale_version", 0):,} stale-version, '
+             f'{_d.get("cache_served_no_provenance", 0):,} with no provenance) &nbsp;•&nbsp; '
              f'fresh OCR {_d.get("ocr_runs_fresh", 0):,}. &nbsp;"Reviewed" counts cache rehydrates and is NOT a '
              "validation count.")(ctx.get("debug") or {}),
             ParagraphStyle("vcov", parent=note_st, fontSize=9, leading=12, alignment=0,
@@ -5388,12 +5678,34 @@ def build_pdf(out_path, report_no, ctx):
         _vrow("&nbsp;&nbsp;• Products Freshly Read Live (cold read this run)", f"{_vg('products_freshly_read_live', 0):,}") +
         _vrow("&nbsp;&nbsp;• Products Revalidated Live (cache-audit re-pull)", f"{_vg('products_revalidated_live', 0):,}") +
         _vrow("Products NOT verified live this run (cache-served / unreadable)", f"{_vg('products_served_from_cache_unverified', 0):,}") +
-        "<i>Count legend (these are slightly different by design): COA files opened this run "
-        f"({_vg('pdfs_downloaded_or_opened', 0):,}) &ge; PDFs parsed ({max(0, _reviewed - _broken):,}, opened "
-        f"minus broken/missing links) ; products reviewed ({_reviewed:,}) = products evaluated after the "
-        "date-window filter.</i><br/>" +
-        _vrow("COA files opened this run", f"{_vg('pdfs_downloaded_or_opened', 0):,}", "downloaded live when online; read from cache when offline") +
-        _vrow("PDFs Parsed", f"{max(0, _reviewed - _broken):,}", "reviewed minus broken/missing links") +
+        # E-3 — cache-served products broken out by PROVENANCE (reuse with version-current provenance on
+        # file is a TRUSTED reuse, not a coverage gap; only no-provenance reuse is the real concern).
+        _vrow("&nbsp;&nbsp;• Cache-served WITH live-verification provenance (prior run, version-current)",
+              f"{_vg('cache_served_provenance_backed', 0):,}",
+              "reused from cache but provenance on file: live-verification timestamp + analysis version + "
+              "source SHA-256 recorded by a prior run — a trusted reuse, NOT an unverified value") +
+        _vrow("&nbsp;&nbsp;• Cache-served, provenance STALE (verified under an older analysis version)",
+              f"{_vg('cache_served_stale_version', 0):,}",
+              "provenance on file but written under a superseded analysis version — must be re-verified") +
+        _vrow("&nbsp;&nbsp;• Cache-served WITHOUT provenance (no recorded live verification)",
+              f"{_vg('cache_served_no_provenance', 0):,}",
+              "the genuine coverage concern: reused with no live-verification event on file — re-verify or hold. "
+              "Full list: Data Exports/cache_provenance_audit.csv") +
+        "<i>Count legend — these use DIFFERENT denominators by design, each stated explicitly so every "
+        "&lsquo;A = B &minus; C&rsquo; below is arithmetically true: "
+        f"<b>PDFs parsed ({max(0, _reviewed - _broken):,}) = products reviewed ({_reviewed:,}) &minus; "
+        f"broken/missing links ({_broken:,})</b>. &lsquo;COA files opened&rsquo; "
+        f"({_vg('pdfs_downloaded_or_opened', 0):,}) is a SEPARATE denominator (every COA file accessed "
+        "this run, live or cached) and is NOT the minuend here; &lsquo;products reviewed&rsquo; is the "
+        "in-window products evaluated after the date-window filter.</i><br/>" +
+        _vrow("COA files opened this run", f"{_vg('pdfs_downloaded_or_opened', 0):,}", "downloaded live when online; read from cache when offline (own denominator)") +
+        _vrow("PDFs Parsed", f"{max(0, _reviewed - _broken):,}", f"= products reviewed ({_reviewed:,}) minus broken/missing links ({_broken:,})") +
+        _vrow("Individual values routed to review (unverified in own COA)",
+              f"{_vg('coa_value_unverified_routed_to_review', 0):,}",
+              "VALUE-level, NOT product-level: single analyte values that could not be re-verified in their own "
+              "COA within otherwise-published products — held from those rows; a SEPARATE denominator from the "
+              "product-level held-out buckets (so it is not part of the product 'Outstanding' tally). "
+              "Full list: Data Exports/coa_verification_queue.csv") +
         _vrow("PDFs Re-OCRed (fresh)", f"{_ocr_ok:,}", "image COAs re-OCR'd from the raw PDF this run") +
         _vrow("Image COAs (approx)", f"{_ocr_ok + _ocr_fail:,}", "proxy: fresh-OCR successes + OCR failures") +
         _vrow("Text COAs (approx)", f"{max(0, _reviewed - _ocr_ok - _ocr_fail):,}", "proxy: reviewed minus image COAs") +
@@ -5625,6 +5937,15 @@ def build_pdf(out_path, report_no, ctx):
     # ---- SECTION 2 — TOP-100 HIGHEST-CANNABINOID FLOWER (uncapped display; implausible flagged) ----
     _topf = top_cannabinoid_flower_rows(ctx.get("all_results_for_audit") or [], ctx.get("ident"),
                                         ctx.get("lmap"), n=100)
+    # B-2 GATE: the flower table's >45% "(implausible)" rows and Section C (Product-Type/Potency
+    # Classification Review) draw from the SAME population (non-infused flower, Total Cannabinoids >45%),
+    # so they must agree. If Section C reports zero, the flower table cannot contain a >45% row, and vice
+    # versa. Abort on inconsistency rather than print a self-contradiction.
+    _impl_tbl = sum(1 for r in _topf if r.get("implausible"))
+    _sec_c = len(ctx.get("potency_typemismatch") or [])
+    if (_sec_c == 0) != (_impl_tbl == 0):
+        raise SystemExit(f"B-2 inconsistency: flower-table >45% rows={_impl_tbl} but Section C "
+                         f"product-type-mismatch={_sec_c}. One source missed the other — ABORT.")
     if _topf:
         story.append(Paragraph("Top 100 Highest-Cannabinoid Flower Products (statewide)", miniH))
         story.append(Paragraph(
@@ -5678,7 +5999,7 @@ def build_pdf(out_path, report_no, ctx):
                       f'<font size="7" color="#7a1f17">{esc(_sev)}</font>'
                       + ("<br/><font size=\"7\" color=\"#C0392B\"><b>SEVERE CHROMIUM &ge;2&times;</b></font>"
                          if r.get("severe_chromium") else ""))
-            _prodcell = (f'<b>{esc(r["product"])}</b><br/>{esc(producer_display(r.get("producer",""), r.get("product","")))}'
+            _prodcell = (f'<b>{esc(r["product"])}</b><br/>{esc(producer_label_short(r.get("producer",""), ident))}'
                          + (f'<br/><font size="7">{esc(r["shared_id"])}</font>' if r.get("shared_id") else "")
                          + (f'<br/><font size="7" color="#7a1f17">{esc(r["product_type_note"])}</font>'
                             if r.get("product_type_note") else (f'<br/><font size="7">{esc(r.get("product_type",""))}</font>'
@@ -6067,6 +6388,13 @@ def build_pdf(out_path, report_no, ctx):
 
     # ---- LABS WITH ALTERED PASS / FAIL STATUS — failing results promoted out of the retest/conflict notes ----
     _failfind = conflict_failure_findings(_conflicts)
+    # B-3 regression guard: the altered-status table must never contain a conflict-TYPE label (e.g.
+    # "Within-document (single COA)") in the Contaminant column, nor a row with no real contaminant.
+    # Those are excluded at the source (conflict_failure_findings); abort loud if one ever slips through.
+    _b3_bad = [r for r in _failfind
+               if str(r.get("category", "")).lower().startswith("within-document")
+               or not ((r.get("analyte") or "").strip() or (r.get("category") or "").strip())]
+    assert not _b3_bad, f"B-3 invariant: malformed altered-status row(s) with no real contaminant: {_b3_bad[:2]}"
     if _failfind:
         story.append(H("Labs With Altered Pass / Fail Status", color=RED))
         intro_box("Products where a lab's pass/fail status was <b>altered</b> — a result that <b>FAILED its own COA "
@@ -6080,8 +6408,14 @@ def build_pdf(out_path, report_no, ctx):
                   "<b>Verify against the linked COA — a lead, not a conclusion.</b>", color="#7a1f17")
         _ff_rows = []
         for i, r in enumerate(_failfind[:MAX_TABLE_ROWS], 1):
-            _v = (clean_value(r["value"], r.get("unit", "")) if isinstance(r["value"], (int, float))
-                  else (r.get("raw") or str(r["value"])))
+            # B-3 guard: never print "None" as a failing value. A real number formats; a raw detection
+            # string shows; anything else is an explicit UNVERIFIED marker (not a bare "None").
+            if isinstance(r["value"], (int, float)):
+                _v = clean_value(r["value"], r.get("unit", ""))
+            elif (r.get("raw") or "").strip():
+                _v = r["raw"].strip()
+            else:
+                _v = "UNVERIFIED — value not extractable"
             _l = clean_value(r["limit"], r.get("unit", "")) if isinstance(r["limit"], (int, float)) else "—"
             _fold = (f"{round((r['value'] or 0) / r['limit'], 2)}&times;"
                      if r.get("limit") and isinstance(r["value"], (int, float)) else "—")
@@ -6623,7 +6957,7 @@ def build_pdf(out_path, report_no, ctx):
                   "the mold does not remove its toxins, a microbial remediation without an itemized mycotoxin "
                   "clearance leaves the toxin question open. <b>A review gap, not an accusation.</b>", color="#7a1f17")
         _mg_rows = [[Paragraph(str(i), cellc), Paragraph(esc(tcase(g["product"])), cell),
-                     Paragraph(esc(producer_display(g.get("producer", ""), g.get("product", ""))), cell),
+                     Paragraph(esc(producer_label_short(g.get("producer", ""), ident)), cell),
                      Paragraph(esc(g.get("analyte", "")), cell), Paragraph(esc(str(g.get("date") or "—")), cellc),
                      Paragraph((f'<link href="{esc(g["coa_url"])}"><font color="#1155CC"><u>COA</u></font></link>'
                                 if g.get("coa_url") else "—"), coacell)]
@@ -6867,7 +7201,7 @@ def build_pdf(out_path, report_no, ctx):
                           ("thc_potency", "THC potency")):
         cit, url = CT_REG_CITATIONS.get(catkey, ("", ""))
         cite_rows.append([Paragraph(esc(label), cellb),
-                          Paragraph(f'{esc(cit)}<br/><font color="#2C5AA0">{esc(url)}</font>', cell)])
+                          Paragraph(f'{esc(cit)}<br/><font color="#2C5AA0">{esc(_short_url(url))}</font>', urlcell)])
     story.append(Paragraph(f"<b>Citations</b> (confirmed {esc(CT_REG_AS_OF)}; the program re-consults these live each run):", CTX))
     story.append(tbl(["Category", "CT statute / regulation / policy citation"], cite_rows,
                      [2.0*inch, 7.2*inch], hc=NAVY, band="#eef2f5", aligns=["L", "L"]))
@@ -6891,7 +7225,7 @@ def build_pdf(out_path, report_no, ctx):
                 detail = "not fetched this build (" + esc(str(s.get("http_status", s.get("status", "—")))) + ")"
                 sha = "—"
             prov_rows.append([Paragraph(esc(s.get("label", "")), cell),
-                              Paragraph(f'<font color="#2C5AA0">{esc(s.get("url", ""))}</font>', cell),
+                              Paragraph(f'<font color="#2C5AA0">{esc(_short_url(s.get("url", "")))}</font>', urlcell),
                               Paragraph(esc(detail), cell), Paragraph(esc(sha), cell_nb)])
         story.append(tbl(["Source", "URL", "Cached document", "Content hash"], prov_rows,
                          [2.1*inch, 3.5*inch, 2.2*inch, 1.6*inch], hc=NAVY, band="#eef2f5",
@@ -7144,16 +7478,33 @@ def build_pdf(out_path, report_no, ctx):
     _ci_acquired = max(0, _ci_expected - _ci_broken)                          # COAs we hold a document for
     _ci_parsed   = max(0, _ci_acquired - _ci_unread)                         # COAs that yielded extractable content
     _ci_verified = int(_ci_dbg.get("products_live_verified_this_run", 0) or 0)  # corrected live-verified metric
-    _ci_queue    = int(ctx.get("n_queue", 0) or 0)
-    _ci_held     = int(_ci_sm.get("extractions_held_uncertain", 0) or len(ctx.get("format_holds") or []) or 0)
-    _ci_mismatch = int(_ci_sm.get("rows_excluded_for_coa_source_mismatch",
-                                  _ci_sm.get("coa_source_mismatch_count", 0)) or 0)
-    _ci_outstanding = _ci_broken + _ci_unread + _ci_queue + _ci_held + _ci_mismatch
+    # A-1..A-4 / SB-2 / SB-3: read the ONE held-out decomposition computed in the main flow (the buckets
+    # that provably sum to flagged-minus-published). Every held-out/outstanding headline derives from this.
+    _hob = ctx.get("held_out_buckets") or {}
+    _ci_queue    = int(_hob.get("verification_queue", ctx.get("n_queue", 0)) or 0)   # the REAL queue
+    _ci_held     = int(_hob.get("uncertain_extraction_held", len(ctx.get("format_holds") or [])) or 0)
+    _ci_plaus    = int(_hob.get("plausibility_gated", _ci_dbg.get("held_out_plausibility_gated", 0)) or 0)
+    _ci_mismatch = int(_hob.get("coa_source_mismatch",
+                                _ci_sm.get("rows_excluded_for_coa_source_mismatch",
+                                           _ci_sm.get("coa_source_mismatch_count", 0))) or 0)
+    _ci_flagged_held = int(ctx.get("flagged_held_out_total", _ci_queue + _ci_held + _ci_plaus + _ci_mismatch) or 0)
+    # SB-3 belt-and-suspenders at render: the flagged-held-from-publication buckets MUST equal flagged-pub.
+    assert _ci_queue + _ci_held + _ci_plaus + _ci_mismatch == _ci_flagged_held, (
+        f"SB-3 render: held-out buckets {(_ci_queue,_ci_held,_ci_plaus,_ci_mismatch)} "
+        f"!= flagged_held_out_total {_ci_flagged_held}")
+    _ci_outstanding = _ci_broken + _ci_unread + _ci_queue + _ci_held + _ci_plaus + _ci_mismatch
     # FAIL LOUD: no ratio may divide by zero.
     for _dn, _dv in (("expected", _ci_expected), ("acquired", _ci_acquired), ("reviewed", _ci_reviewed)):
         if _dv <= 0:
             sys.exit(f"FAIL — COVERAGE INTEGRITY ERROR: denominator '{_dn}' is {_dv} (must be > 0).")
-    _ci_pct = lambda n, d: f"{round(100.0 * n / d, 1)}%" if d else "n/a"
+    # A-7: never round a coverage % UP to 100.0% while items are missing. Show 100.0% ONLY when complete
+    # (n>=d); otherwise FLOOR to one decimal so 99.95% (e.g. 8,662/8,666 with 4 broken) reads 99.9%, not 100.0%.
+    def _ci_pct(n, d):
+        if not d:
+            return "n/a"
+        if n >= d:
+            return "100.0%"
+        return f"{math.floor(100.0 * n / d * 10) / 10:.1f}%"
     story.append(Paragraph("Coverage Integrity Summary", miniH))
     story.append(Paragraph(
         "Real coverage figures for this run. <b>Acquisition and parsing are window-scale</b> (the full date "
@@ -7176,9 +7527,14 @@ def build_pdf(out_path, report_no, ctx):
                      [[Paragraph(esc(a), cell), Paragraph(f"<b>{esc(b)}</b>", cellc)] for a, b in _ci_rows],
                      [5.6*inch, 3.2*inch], big=False))
     story.append(Paragraph(
-        f"<i>Outstanding = broken/missing links {_ci_broken:,} + unreadable {_ci_unread:,} + verification-queue "
-        f"{_ci_queue:,} + uncertain-held {_ci_held:,} + source-mismatch {_ci_mismatch:,}. These are coverage gaps "
-        "held OUT of findings, itemized in the sections below.</i>", note_st))
+        f"<i>Outstanding = {_ci_outstanding:,}, in two explicitly-labeled groups. "
+        f"<b>(a) COA-level coverage gaps</b> (no usable document): broken/missing links {_ci_broken:,} + "
+        f"unreadable {_ci_unread:,}. "
+        f"<b>(b) Flagged rows held from publication</b> (the document was read, but the value was not published): "
+        f"verification-queue {_ci_queue:,} + uncertain-extraction {_ci_held:,} + plausibility-gated {_ci_plaus:,} + "
+        f"source-mismatch {_ci_mismatch:,} = {_ci_flagged_held:,}, which EQUALS flagged ({int(_ci_dbg.get('flagged_total',0)):,}) "
+        f"minus published ({int(_ci_dbg.get('flagged_published',0)):,}). Each group has its own denominator by design; "
+        "every item is itemized in the sections below.</i>", note_st))
     # COVERAGE-GAP DIAGNOSIS (open item #2): the EXACT per-COA reason every gap COA was held out of
     # findings — diagnosed from the run's own _coa_status + parse_note (never re-fetched). Full per-COA
     # detail is in Data Exports/coverage_gap_diagnosis.csv.
@@ -7207,7 +7563,7 @@ def build_pdf(out_path, report_no, ctx):
     _acct = ctx.get("acct")
     if _acct is not None:
         story.append(Paragraph(f"Reconciled Verification Breakdown &mdash; mode: {esc(str(_acct.mode))}", miniH))
-        story.append(Paragraph("<br/>".join(esc(_l) for _l in verification_breakdown_lines(_acct)),
+        story.append(Paragraph("<br/>".join(esc(_l) for _l in verification_breakdown_lines(_acct, ctx.get("debug") or {})),
                                ParagraphStyle("vbreak", parent=CTX, fontSize=9.5, leading=13, alignment=0)))
         # SECTION 3 — Record Accounting: every record in exactly one tier-1 bucket; tier-1 sums to the window
         # (the build already aborts if it doesn't). Tier-2 are informational sub-counts within Reviewed.
@@ -7394,12 +7750,18 @@ def build_pdf(out_path, report_no, ctx):
                 story.append(_scat)
             # per-grouping detail blocks for the strongest groups (score >= 50)
             for g in [x for x in _ranked if x["score"] >= 50][:6]:
+                # C-5 guard: a printed "A to B" date range MUST satisfy A<=B chronologically. Defensively
+                # order here so a future regression can never render a reversed range (belt-and-suspenders
+                # to the chronological sort upstream).
+                _dlo, _dhi = g.get('date_lo') or '', g.get('date_hi') or ''
+                if _dlo and _dhi and v4.parse_date(_dlo) > v4.parse_date(_dhi):
+                    _dlo, _dhi = _dhi, _dlo
                 story.append(Paragraph(
                     f"<b>Producer:</b> {esc(g['producer'])} &nbsp;|&nbsp; <b>Lab:</b> {esc(g['lab'])} "
                     f"&nbsp;|&nbsp; <b>Analyte:</b> {esc(g['analyte'])}<br/>"
                     f"<b>Threshold:</b> {int(g['limit']):,} {g['unit']} legal"
                     + (f" (program watch {int(g['program']):,} {g['unit']})" if g.get("program") else "")
-                    + f" &nbsp;|&nbsp; <b>Date range:</b> {esc(g['date_lo'] or 'n/a')} to {esc(g['date_hi'] or 'n/a')}<br/>"
+                    + f" &nbsp;|&nbsp; <b>Date range:</b> {esc(_dlo or 'n/a')} to {esc(_dhi or 'n/a')}<br/>"
                     f"<b>Total results:</b> {g['total']} &nbsp;|&nbsp; <b>Near-threshold (95–100%):</b> {g['near']} "
                     f"&nbsp;|&nbsp; <b>Over-limit:</b> {g['over']}<br/>"
                     f"<b>Observed near rate:</b> {100.0*g['obs_rate']:.0f}% &nbsp;|&nbsp; "
@@ -7562,16 +7924,43 @@ def build_pdf(out_path, report_no, ctx):
     story.append(tbl(["Category", "Flagged", "Parsed / Reported-on", "Status"], rows,
                      [2.6*inch, 1.0*inch, 1.6*inch, 2.7*inch], big=False))
     story.append(Paragraph("Producer Identity & Internet Source Validation", miniH))
-    story.append(Paragraph("Legal entity → DBA with source-confidence. Verified against data.ct.gov (egd5-wb6r), CT "
-                           "eLicense, the DCP brand registry, and cited public sources.", CTX))
+    story.append(Paragraph("The producer identity CHAIN, shown un-flattened: <b>Legal Entity (LLC) &rarr; Trade Name "
+                           "&rarr; DBA / Brand(s)</b> as three SEPARATE levels (never concatenated). Findings and "
+                           "ranking tables use the Trade Name only; the LLC and brand list live here. Verified against "
+                           "data.ct.gov (egd5-wb6r), CT eLicense, the DCP brand registry, and cited public sources. "
+                           "An unknown level shows <i>&mdash; (unverified)</i> &mdash; never a guess.", CTX))
+    _canon = ctx["ident"].canonical_records()
     rows = []
-    for r in sorted(ctx["ident"].cache.values(), key=lambda r: -r["confidence"]):
-        rows.append([Paragraph(esc(r.get("legal", "")), cell), Paragraph(esc(r["common"] or "—"), cell),
-                     Paragraph(esc(", ".join(r["brands"]) if r["brands"] else "—"), cell),
-                     Paragraph(f'{r["confidence"]}%', cellc),
-                     Paragraph(esc(r["source"] or ("COA/registry product names" if r["brands"] else "—")), cell)])
-    story.append(tbl(["Legal Entity (Appendix)", "Common / DBA", "Brands", "Confidence", "Source"], rows,
-                     [2.6*inch, 1.8*inch, 2.0*inch, 1.0*inch, 2.8*inch], big=False))
+    for c in sorted(_canon, key=lambda c: -c["identity_confidence"]):
+        rows.append([Paragraph(esc(c["legal_entity_llc"] or "— (unverified)"), cell),
+                     Paragraph(esc(c["trade_name"] or "— (unverified)"), cell),
+                     Paragraph(esc(", ".join(c["dba_brands"]) if c["dba_brands"] else "— (unverified)"), cell),
+                     Paragraph(f'{c["identity_confidence"]}%', cellc),
+                     Paragraph(esc(c["identity_source"] or ("COA/registry product names" if c["dba_brands"] else "— (unverified)")), cell)])
+    story.append(tbl(["Legal Entity (LLC)", "Trade Name", "DBA / Brand(s)", "Confidence", "Source"], rows,
+                     [2.4*inch, 1.7*inch, 2.1*inch, 0.95*inch, 2.85*inch], big=False,
+                     aligns=["L", "L", "L", "C", "L"]))
+    # ---- IDENTITY COLLISION block (§3): a brand or trade name that maps to >1 legal entity is surfaced
+    #      side-by-side, NEVER merged or silently picked. (The hard abort, if a collision were rendered as a
+    #      merged row, is enforced in the main flow before render.) ----
+    _collisions = ctx.get("identity_collisions") or []
+    if _collisions:
+        story.append(Paragraph("IDENTITY COLLISION — manual review (NOT resolved automatically)",
+                               ParagraphStyle("idcol", parent=miniH, fontSize=12, textColor=RED, spaceBefore=8)))
+        for col in _collisions:
+            _chains = "<br/>".join(
+                f"&nbsp;&nbsp;<b>Chain {chr(65+i)}:</b> {esc(ch['legal_entity_llc'] or '— (unverified)')} "
+                f"&rarr; {esc(ch['trade_name'])} &rarr; [{esc(', '.join(ch['dba_brands']) or '—')}] "
+                f"(conf {ch['identity_confidence']}, src {esc((ch['identity_source'] or '—')[:60])})"
+                for i, ch in enumerate(col["chains"]))
+            story.append(Paragraph(
+                f'<b>Brand / name "{esc(col["name"])}" maps to {len(col["chains"])} legal entities</b> '
+                f"&mdash; this is NOT resolved automatically:<br/>{_chains}<br/>"
+                "<i>Verify the correct licensee&rarr;brand mapping at portal.ct.gov/dcp brand registry / CT eLicense "
+                "before relying on producer-level counts. Both chains are kept; neither is dropped.</i>",
+                ParagraphStyle("idcolbody", parent=CTX, fontSize=9.5, leading=13,
+                               backColor=colors.HexColor("#fbe3e1"), borderColor=RED, borderWidth=0.6,
+                               borderPadding=6, spaceBefore=4, spaceAfter=6)))
     # ---- COA Format Learning & Extraction Confidence (historical-format awareness) ----
     story.append(Paragraph("COA Format Learning &amp; Extraction Confidence", miniH))
     cmix = ctx.get("conf_mix") or {}
@@ -7620,16 +8009,41 @@ def build_pdf(out_path, report_no, ctx):
     if fyr:
         # ISSUE #36/#37/#38 — make the TWO readiness layers explicit so they never read as a contradiction.
         _dbgL = ctx.get("debug") or {}
-        _ledger_years = ", ".join(_dbgL.get("training_ledger_years_present", []) or []) or "none yet"
-        _win_not_in = ", ".join(_dbgL.get("report_window_years_not_in_training_ledger", []) or [])
+        _ledger_years = ", ".join(_dbgL.get("training_ledger_years_present", []) or []) or "none"
+        _win_years = ", ".join(sorted({str(r.get("year")) for r in fyr if r.get("year")}))
+        _pipe = str(_dbgL.get("training_pipeline_status", "") or "")
+        _disc = "DISCONNECT" in _pipe
+        # F-1: state AFFIRMATIVELY which parser/analysis version validated THIS report's window years, and
+        # that the persisted Training Ledger (a separate, historical artifact) is NOT used for them — so no
+        # "two layers, not a contradiction" hedge is needed; the separation is explicit.
         story.append(Paragraph(
-            "<b>Two layers — read this first.</b> The verdicts below are computed <b>live for THIS report's "
-            "window years</b>. They are SEPARATE from the persisted <b>Training Ledger</b>, which currently holds: "
-            f"<b>{esc(_ledger_years)}</b> (whatever was previously <b>learn</b>-ed). So the Training Ledger line in "
-            "the debug log may list <i>different</i> years than this section — that is two layers, NOT a "
-            "contradiction. Window year(s) not in the ledger"
-            + (f" (<b>{esc(_win_not_in)}</b>)" if _win_not_in else "")
-            + " are rated live this run, not from stored training.", CTX))
+            f"<b>What validated this report's window years.</b> Window year(s) <b>{esc(_win_years or 'in range')}</b> "
+            f"were parsed and validated <b>LIVE this run</b> by parser version <b>engines-v4+v5@{esc(SOFTWARE_VERSION)}</b> "
+            f"(analysis version <b>{esc(ANALYSIS_VERSION)}</b>) — the verdicts below are from that live run. The "
+            f"persisted <b>Training Ledger</b> is a SEPARATE historical artifact (it currently holds only year(s) "
+            f"<b>{esc(_ledger_years)}</b> from a prior <b>learn</b>); it is <b>not used for, and contributes nothing "
+            "to, the window-year verdicts above</b>. The 2015 ledger line elsewhere is historical provenance only and "
+            "does not apply to this window.", CTX))
+        # F-4 — affirmative, explicit 2015-isolation statement (count-backed) when the window starts after 2015.
+        _f4_lo = _dbgL.get("window_lower_bound_year")
+        if _f4_lo and int(_f4_lo) > 2015:
+            story.append(Paragraph(
+                f"<b>2015 isolation (explicit).</b> This window begins in <b>{esc(str(_f4_lo))}</b>; the date-window "
+                "integrity filter (effective COA test date) excludes 2015 entirely. Verified this run: "
+                f"<b>{int(_dbgL.get('pre_window_2015_records_in_window', 0))}</b> record(s) with a 2015-or-earlier "
+                "test date contributed to this window's findings or coverage (the run ABORTS if that count is "
+                "ever non-zero). 2015 appears only as an isolated historical-provenance line, never as a window value.",
+                CTX))
+        if _disc:
+            story.append(Paragraph(
+                "<b>NOTE — training-ledger version differs from this run.</b> The persisted Training Ledger was written "
+                f"under a <b>different</b> parser/analysis version than this run ({esc(SOFTWARE_VERSION)}/{esc(ANALYSIS_VERSION)}). "
+                "This does NOT affect the window-year verdicts (which were validated live this run, above); it only "
+                "means the historical ledger is stamped to an older version. Re-running <b>learn</b> is deterministic "
+                "and changes nothing — the ledger simply carries its original version stamp.",
+                ParagraphStyle("disc", parent=CTX, fontSize=9.5, leading=13, textColor=colors.HexColor("#7a5c00"),
+                               backColor=colors.HexColor("#fff4e0"), borderColor=colors.HexColor("#e0c389"),
+                               borderWidth=0.6, borderPadding=6, spaceBefore=4, spaceAfter=6)))
         story.append(Paragraph(
             "<b>Why a year can show a high Format-Recognition Conf % but still read PARTIAL or NOT READY.</b> The "
             "Conf % measures only how well the parser <b>recognized the COA layout</b> for the "
@@ -7656,6 +8070,44 @@ def build_pdf(out_path, report_no, ctx):
                           "Conf (H/M/L/U)", "Format-Recog Conf %", "Ready For Reports?"], rows,
                          [0.7*inch, 2.5*inch, 1.1*inch, 2.3*inch, 1.3*inch, 0.8*inch, 1.8*inch],
                          big=False, aligns=["C", "L", "R", "L", "C", "R", "L"]))
+        # F-2 — EXPLICIT per-window-year readiness EVIDENCE. A report that rates a year READY for officials
+        # must SHOW the evidence, not just print a verdict. For each window year, the FOUR readiness criteria
+        # are evaluated with PASS (✓) / UNMET (✗) and the actual measured value, using the SAME thresholds the
+        # verdict itself is computed from (COAFormatLearner._verdict / MIN_SAMPLE) so the evidence can NEVER
+        # disagree with the verdict. A year that is not READY shows exactly WHICH criterion fell short.
+        _MS = COAFormatLearner.MIN_SAMPLE
+
+        def _crit_cells(r):
+            n = int(r.get("sampled", 0) or 0)
+            cc = r.get("core_cov", {}) or {}
+            cann, micro, metal = cc.get("cannabinoids", 0.0), cc.get("microbials", 0.0), cc.get("metals", 0.0)
+            cr = float(r.get("conf_rate", 0.0) or 0.0)
+            unc_rate = (int(r.get("uncertain", 0) or 0) / n) if n else 0.0
+            lcells = r.get("lab_cells", []) or []
+            weak_lab = next((lc.get("lab") for lc in lcells if lc.get("verdict") == "NOT READY"), "")
+            mark = lambda ok: ("✓ " if ok else "✗ ")
+            # The four criteria mirror _verdict EXACTLY (sample>=MIN_SAMPLE; every seen lab layout trained;
+            # conf>=85% & uncertain<=15%; universal core panels>=50%, metals>=30% only modulates READY/PARTIAL).
+            c1 = (n >= _MS, f"{n:,} COAs (≥{_MS})")
+            c2_ok = bool(lcells) and not weak_lab
+            c2 = (c2_ok, (f"{len(lcells)} lab(s); '{weak_lab}' NOT READY" if weak_lab
+                          else (f"{len(lcells)} lab(s), all trained" if lcells else "none sampled")))
+            c3 = (cr >= 0.85 and unc_rate <= 0.15, f"{cr*100:.0f}% conf / {unc_rate*100:.0f}% unc")
+            c4_ok = min(cann, micro) >= 0.50
+            c4 = (c4_ok, f"cann {cann*100:.0f}% / micro {micro*100:.0f}% / metals {metal*100:.0f}%")
+            return [Paragraph(str(r["year"]), cellc)] + [
+                Paragraph(mark(ok) + esc(txt), cell) for ok, txt in (c1, c2, c3, c4)] + [
+                Paragraph(esc(r.get("verdict", "")), cell)]
+
+        story.append(Paragraph("<b>Per-year readiness evidence (the four criteria, measured).</b> Each window "
+            "year below is judged READY only when ALL four are met; the cells show the actual value against the "
+            "threshold so the verdict is auditable. ✗ marks the criterion that holds a year at PARTIAL / NOT READY.",
+            CTX))
+        story.append(tbl(["Year", "1. Sample size", "2. Lab layouts", "3. Era confidence",
+                          "4. Core panels parse", "Verdict"],
+                         [_crit_cells(r) for r in fyr],
+                         [0.6*inch, 1.5*inch, 2.0*inch, 1.7*inch, 2.3*inch, 1.4*inch],
+                         big=False, aligns=["C", "L", "L", "L", "L", "L"]))
         # Which years/labs are still low/uncertain confidence?
         low_years = [str(r["year"]) for r in fyr if r["conf_rate"] < 0.90 or not r.get("ready")]
         low_labs = sorted({lab for r in fyr if (r["conf_rate"] < 0.90 or not r.get("ready"))
@@ -7719,6 +8171,10 @@ def build_pdf(out_path, report_no, ctx):
         "ocr_cache_hits": "Image-only COAs whose OCR text came from the persistent OCR cache (no re-OCR).",
         "cache_audit_status": "Active cache self-audit result: the cache is only a speed hint — a live sample is re-pulled each online run and LIVE WINS (cache verified vs live / DISTRUSTED->full live re-pull / skipped offline / disabled).",
         "cache_audit_sampled_live": "How many cached COAs were re-pulled LIVE and compared to the cache this run (stride-sampled across the window; auto-widened on disagreement).",
+        "cache_served_provenance_backed": "Cache-served products whose live-verification provenance (timestamp + analysis version + source SHA-256) is on file AND version-current — a TRUSTED reuse, not an unverified value (E-3).",
+        "cache_served_stale_version": "Cache-served products with provenance on file but written under a SUPERSEDED analysis version — must be re-verified (E-4 version-bump invalidation).",
+        "cache_served_no_provenance": "Cache-served products with NO recorded live-verification provenance — the genuine coverage concern; re-verify or hold (E-3).",
+        "cache_served_total": "All products served from cache this run (not live-touched) = provenance-backed + stale + no-provenance.",
         "cache_audit_value_conflicts": "Sampled COAs where cache and live BOTH held a value but they DIFFERED (stale/wrong cache) — any >0 distrusts the cache and forces a full live re-pull.",
         "cache_audit_cache_corrected": "Cached rows the audit corrected to match the live source (live always wins).",
         "implausible_values_gated_from_publication": "Would-be-published values that FAILED a physical units/ranges plausibility cross-check and were EXCLUDED to review (never shipped) — target 0.",
@@ -7883,6 +8339,7 @@ def build_pdf(out_path, report_no, ctx):
 
     doc.build(_reflow(story), onFirstPage=_footer, onLaterPages=_footer)
     print(f"Wrote {out_path}")
+    _post_render_audit(out_path)   # C-0/C-4/SB-4/SB-5: glyph + overflow audit on the rendered PDF
 
 
 def producer_short_label(full_label):
@@ -7978,7 +8435,8 @@ def compute_run_audit(debug, date_trace, products, all_results, pub, flagged, co
                               reason=("" if name in in_report else "no analyzable in-window COA (date-excluded / unreadable / cache-miss)")))
     missing = [r["producer"] for r in prod_rows if r["appears_in_report"] == "no"]
     # COVERAGE-GAP DIAGNOSIS (open item #2): per-COA failure reason for every COA held out of findings.
-    gap_reasons, gap_rows = coverage_gap_diagnosis(all_results, ident)
+    gap_reasons, gap_rows = coverage_gap_diagnosis(all_results, ident,
+                                                    extra_source_mismatch=int(G("_audit_source_mismatch", 0)))
     # status tier
     hi = []
     if in_window and pct_analyzed < 50:
@@ -8157,17 +8615,39 @@ def build_verification_accounting(debug, cov_audit, *, mode, published_findings,
         worst_core_panel=str(A.get("worst_core_panel", "") or ""))
 
 
-def _scope_sentence(acct):
+def _scope_sentence(acct, debug=None):
     """Cover scope sentence, sourced ENTIRELY from the reconciled accounting object (T1). The named
     buckets SUM to 100% of the window and the remainder is attributed to its REAL cause — never a
-    locally-recomputed "remaining %". Returns a ReportLab-ready italic string."""
+    locally-recomputed "remaining %". Returns a ReportLab-ready italic string.
+
+    E-5 — within the cache-served remainder, reuse is reported in its TRUE provenance state: reuse with
+    a version-current live-verification record on file is named a TRUSTED REUSE (never "unverified"),
+    stale-version reuse is named as needing re-verification, and only no-provenance reuse is named the
+    coverage concern. The three sub-counts sum to the cache-served total (E-3)."""
+    debug = debug or {}
     w = acct.window_total or 1
     pc = lambda n: round(100.0 * n / w, 1)
+    _pb = int(debug.get("cache_served_provenance_backed", 0) or 0)
+    _ps = int(debug.get("cache_served_stale_version", 0) or 0)
+    _pn = int(debug.get("cache_served_no_provenance", 0) or 0)
     # Remainder = everything that was NOT freshly/live-verified this run, each named by its real cause.
     parts = []
     if acct.cache_served_unverified:
-        parts.append(f"{acct.cache_served_unverified:,} ({pc(acct.cache_served_unverified)}%) could NOT be "
-                     "verified live this run (broken/unreadable COA link or cache-served)")
+        # Prefer the provenance-aware breakdown when it covers the cache-served bucket; else fall back to
+        # the single honest "could not be verified live" line (e.g. a forensic run with no cache).
+        if (_pb or _ps or _pn) and (_pb + _ps + _pn) >= acct.cache_served_unverified:
+            if _pb:
+                parts.append(f"{_pb:,} ({pc(_pb)}%) were reused from cache with a version-current "
+                             "live-verification record on file (trusted reuse, not re-checked today)")
+            if _ps:
+                parts.append(f"{_ps:,} ({pc(_ps)}%) were reused from cache but their verification predates the "
+                             "current analysis version (flagged for re-verification)")
+            if _pn:
+                parts.append(f"{_pn:,} ({pc(_pn)}%) could NOT be verified live this run and carry no "
+                             "live-verification record (broken/unreadable COA link or no-provenance cache reuse)")
+        else:
+            parts.append(f"{acct.cache_served_unverified:,} ({pc(acct.cache_served_unverified)}%) could NOT be "
+                         "verified live this run (broken/unreadable COA link or cache-served)")
     if acct.ledger_reused:
         parts.append(f"{acct.ledger_reused:,} ({pc(acct.ledger_reused)}%) were carried from prior "
                      "verified-clean runs (not re-checked today)")
@@ -8249,8 +8729,11 @@ def top_cannabinoid_flower_rows(all_results, ident, lmap, n=100):
         if tc is None:
             continue
         tt = thc_value(p, "total_thc")
+        # C-3: use the CONCISE canonical producer label ("Common (PrimaryBrand)") in this dense data table
+        # so the column does not wrap to 2-3 lines (the full legal/brand chain lives in the Producer
+        # Identity appendix). Falls back to the raw producer if no identity resolver.
         try:
-            prod = ident.resolve(p.producer)["label"] if ident else (p.producer or "")
+            prod = producer_short(p, ident) if ident else (p.producer or "")
         except Exception:
             prod = p.producer or ""
         rows.append(dict(producer=prod, product=getattr(p, "product_name", "") or "",
@@ -8496,11 +8979,15 @@ def consistency_audit(debug, acct, cov_audit):
     return problems
 
 
-def verification_breakdown_lines(acct):
+def verification_breakdown_lines(acct, debug=None):
     """ONE reconciled coverage/provenance breakdown, rendered IDENTICALLY in the console and in the PDF
     Technical Validation appendix (both call this function). Buckets are counts AND % of the date window
     and MUST sum to the window (excluded-out-of-window is listed separately, OUTSIDE the window). Reads
-    ONLY the single-source-of-truth object; FAILS LOUD if the in-window buckets do not reconcile."""
+    ONLY the single-source-of-truth object; FAILS LOUD if the in-window buckets do not reconcile.
+
+    E-5 — when `debug` is supplied, the cache-served bucket is further annotated (NOT re-partitioned —
+    the reconciliation still uses acct only) with its provenance breakdown so the reader sees that
+    version-current reuse is a trusted reuse, not an unverified value."""
     w = acct.window_total
     pc = lambda n: (f"{round(100.0 * n / w, 1)}%" if w else "n/a")
     # The prefiltered date window (window_total) splits into the date-test-confirmed slice
@@ -8512,6 +8999,13 @@ def verification_breakdown_lines(acct):
     if total_sum != w:
         raise SystemExit(f"FAIL — COVERAGE BREAKDOWN ERROR: buckets {total_sum:,} != window {w:,} "
                          "(no report emitted).")
+    _d = debug or {}
+    _pb = int(_d.get("cache_served_provenance_backed", 0) or 0)
+    _ps = int(_d.get("cache_served_stale_version", 0) or 0)
+    _pn = int(_d.get("cache_served_no_provenance", 0) or 0)
+    _prov_line = ([f"       provenance of cache-served: {_pb:,} version-current (trusted reuse), "
+                   f"{_ps:,} stale-version (re-verify), {_pn:,} no-provenance (coverage concern)"]
+                  if (_pb or _ps or _pn) else [])
     return [
         f"Window total (prefiltered date window): {w:,}",
         f"  - Freshly live-verified this run: {acct.freshly_live_verified:,} ({pc(acct.freshly_live_verified)})",
@@ -8519,6 +9013,7 @@ def verification_breakdown_lines(acct):
         f"  - Reused from verified-clean ledger (prior runs, NOT re-checked today): {acct.ledger_reused:,} ({pc(acct.ledger_reused)})",
         f"  - NOT verified live this run (broken/unreadable COA link or cache-served): {acct.cache_served_unverified:,} ({pc(acct.cache_served_unverified)})",
         f"       of which broken / missing COA link (no document to verify against): {acct.unreadable_or_broken:,}",
+    ] + _prov_line + [
         f"  - Excluded out-of-window (strict COA test date): {acct.excluded_out_of_window:,} ({pc(acct.excluded_out_of_window)})",
         f"  - Excluded, no confirmable test date: {acct.excluded_no_date:,} ({pc(acct.excluded_no_date)})",
         f"  = all {total_sum:,} of {w:,} products accounted for (reconciled to 100% of the window).",
@@ -8537,12 +9032,52 @@ def write_outputs(ctx):
     P = lambda n: os.path.join(_exports, n)
     lmap, ident, watch = ctx["lmap"], ctx["ident"], ctx["watch"]
 
+    # SB-6 — per-published-finding provenance traceability audit (always written). Each row records whether
+    # the finding traces to a live-verification event (live this run / version-current provenance on file)
+    # and, if so, when + under which analysis version + the source SHA-256 prefix.
+    _w(P("cache_provenance_audit.csv"),
+       ["product", "producer", "registration_number", "report_url", "provenance_state",
+        "traceable", "last_live_verified_at", "verified_analysis_version", "source_sha256_prefix"],
+       ctx.get("sb6_rows", []) or [])
+
+    # B-1 — per-record root-cause export for every Laboratory Data Consistency Flag (THC>TotalCannabinoids
+    # etc.). These rows are HELD, never published; the export shows the parsed cannabinoid fields + the
+    # conflict reason so a reviewer can see exactly which field mis-mapped (the Analytics-legend THCA=9.0
+    # misread was found this way) and confirm the post-fix conflict rate.
+    _b1_rows = []
+    for p in (ctx.get("all_results_for_audit") or []):
+        _reason = thc_conflict(p)
+        if not _reason:
+            continue
+        _b1_rows.append([
+            getattr(p, "product_name", "") or "", getattr(p, "test_lab", "") or "",
+            getattr(p, "registration_number", "") or "", getattr(p, "report_url", "") or "",
+            thc_value(p, "total_thc"), thc_value(p, "total_cannabinoids"), thc_value(p, "total_active"),
+            thc_value(p, "thca"), thc_value(p, "d9_thc"), thc_value(p, "thc"),
+            "yes" if getattr(p, "_online_refetched", False) else "no", _reason])
+    _w(P("thc_conflict_rootcause.csv"),
+       ["product", "lab", "registration_number", "report_url", "total_thc", "total_cannabinoids",
+        "total_active", "thca", "d9_thc", "thc", "freshly_read_live", "reason"], _b1_rows)
+
     # ---- NON-DESTRUCTIVE coverage/failure audit exports (run_failure_audit.json + 4 CSVs) ----
     _aud = ctx.get("cov_audit") or {}
     if _aud:
         try:
             with open(P("run_failure_audit.json"), "w", encoding="utf-8") as f:
                 json.dump(_aud, f, indent=2, default=str)
+        except Exception:
+            pass
+        # V17.5.0 producer-identity exports (acceptance gates G3/G4/G6): the canonical model with the three
+        # identity levels stored SEPARATELY, the producer ranking keyed on producer_id, and any collisions.
+        try:
+            with open(P("producers_canonical.json"), "w", encoding="utf-8") as f:
+                json.dump(ident.canonical_records(), f, indent=2, default=str)
+            with open(P("producer_ranking.json"), "w", encoding="utf-8") as f:
+                json.dump([{"producer_id": r["producer_id"], "trade_name": r["label"],
+                            "reviewed": r["reviewed"], "flagged": r["flagged"]}
+                           for r in (ctx.get("producer_rows") or [])], f, indent=2, default=str)
+            with open(P("identity_collisions.json"), "w", encoding="utf-8") as f:
+                json.dump(ctx.get("identity_collisions") or [], f, indent=2, default=str)
         except Exception:
             pass
         _w(P("producer_coverage_reconciliation.csv"),
@@ -9450,9 +9985,21 @@ def conflict_failure_findings(coa_conflicts):
     whether a later passing result exists for the same lot. Pure read of the conflict records (no re-scan)."""
     out, seen = [], set()
     for c in (coa_conflicts or []):
+        # B-3: within-document (single-COA) cases are a DOCUMENT-STRUCTURE finding (more than one lab
+        # identity / a pass+fail wording inside ONE COA), NOT a cross-COA contaminant over-limit with a
+        # failing numeric value. They carry no (contaminant, value, limit) triple, so promoting them here
+        # printed "Within-document (single COA)" in the Contaminant column with a "None" value. They stay
+        # in the Conflicting-COA section; they must never enter the "Labs With Altered Pass/Fail" table.
+        if c.get("kind") == "within-document":
+            continue
         for side in ("lab1", "lab2"):
             m = c.get(side) or {}
             if str(m.get("status", "")).upper() not in ("FAIL", "DETECTED"):
+                continue
+            # A promoted row MUST carry a real failing measurement: a numeric value, OR a DETECTED
+            # prohibited analyte (raw text). A FAIL with neither is not an extractable exceedance.
+            if m.get("value") is None and not (m.get("raw") or "").strip() \
+                    and str(m.get("status", "")).upper() == "FAIL":
                 continue
             key = (c.get("category", ""), str(m.get("value")), m.get("lab", ""), m.get("date_str", ""))
             if key in seen:
@@ -11826,7 +12373,13 @@ def main():
     _fast = bool(getattr(args, "fast_cache", False))
     _offline = bool(args.offline)
     _require_live = bool(getattr(args, "require_live", False))
-    if _live_verify and not _offline:
+    # --live-verify AND --validate both force a genuine live re-fetch of EVERY COA from its source link
+    # (never reuse a locally-persisted flagged PDF). This is required for an honest forensic claim: SB-6
+    # marks a published finding "live-verified this run" ONLY when its source was actually re-consulted this
+    # run (download_pdf sets _coa_fetched_live → _online_refetched). Without forcing the download, the
+    # persisted FLAGGED COAs (the very ones that become published findings) would be reused from disk and
+    # SB-6 would (correctly) refuse to call them live-verified — aborting the forensic deliverable.
+    if (_live_verify or _require_live) and not _offline:
         v4.FORCE_LIVE_DOWNLOAD = True
         args.full_cache_audit = True
     # TASK 3 — pin down + PRINT what the active flag ACTUALLY does (no flag name may imply more
@@ -12003,6 +12556,12 @@ def main():
     # report-flagged set (trustworthy severity) and publishable subset
     flagged = [p for p in keep if v5.report_severity(p, watch) in ("RED", "ORANGE", "YELLOW") or p.thc_flags or v5.pathogen_detections(p)]
     pub_raw = [p for p in flagged if p._coa_status in PUBLISHABLE]
+    # HELD-OUT DECOMPOSITION (single source of truth for A-1..A-4 / SB-2 / SB-3): a flagged row is held
+    # for exactly ONE reason, applied in pipeline order, each stage removing a DISJOINT set — so the named
+    # buckets SUM to (flagged - pub) by construction (asserted once pub is final, below). The FIRST bucket
+    # is the REAL "COA verification queue": rows whose own live-COA status is not PUBLISHABLE. (This is the
+    # number the Verification-Queue section shows; it is NOT len(flagged)-len(pub), the old A-1 mislabel.)
+    _n_not_publishable = len(flagged) - len(pub_raw)
 
     # --- COA FORMAT LEARNING: HOLD extractions the cross-checks judged UNRELIABLE (a top/detail
     #     pass-fail CONFLICT or a COA that does not match its product record) BEFORE they can be
@@ -12033,6 +12592,39 @@ def main():
     #     its OWN linked COA; exclude any mismatch to a review queue before anything is
     #     derived/published. Integrity over coverage.
     pub, source_mismatches, provenance_rows, src_metrics = audit_published_coa_sources(pub_raw, watch)
+
+    # --- HELD-OUT RECONCILIATION (A-1..A-4, SB-2/SB-3): every flagged-but-unpublished row lands in EXACTLY
+    #     one named bucket; the buckets must SUM to len(flagged)-len(pub) or the run ABORTS (no orphaned
+    #     count). This is the single source of truth that every section's held-out/outstanding tally reads.
+    # A-3: source-mismatch is ONE bucket = held-out rows with a product/value-mismatch STATUS (the same rows
+    # the Coverage-Gap Diagnosis classifies "source mismatch") PLUS rows excluded during the publish-path
+    # source-binding audit. The two stages are disjoint; their sum is the SINGLE source-mismatch number shown
+    # everywhere. Split the held-mismatch rows OUT of the verification queue so the bucket == the diagnosis.
+    _n_held_mismatch = sum(1 for p in flagged
+                           if getattr(p, "_coa_status", "") in (MATCH_PRODUCT_MISMATCH, MATCH_VALUE_MISMATCH))
+    _n_audit_mismatch = int(src_metrics.get("rows_excluded_for_coa_source_mismatch",
+                                            src_metrics.get("coa_source_mismatch_count", len(source_mismatches))) or 0)
+    _n_source_mismatch = _n_held_mismatch + _n_audit_mismatch
+    debug["coa_source_mismatch_count"] = _n_source_mismatch   # single source of truth for the debug dump
+    src_metrics["coa_source_mismatch_count"] = _n_source_mismatch
+    src_metrics["_audit_source_mismatch"] = _n_audit_mismatch  # the publish-audit slice, for the gap diagnosis
+    debug["_audit_source_mismatch"] = _n_audit_mismatch         # read by coverage_gap_diagnosis (via compute_run_audit)
+    held_out_buckets = {
+        "verification_queue": _n_not_publishable - _n_held_mismatch,   # not-publishable EXCLUDING mismatch-status
+        "uncertain_extraction_held": len(format_holds),    # top/detail pass-fail conflict or product mismatch
+        "plausibility_gated": _n_implausible_gated,         # failed a physical units/range plausibility check
+        "coa_source_mismatch": _n_source_mismatch,          # held-out mismatch-status + publish-audit excluded
+    }
+    flagged_held_out_total = len(flagged) - len(pub)
+    _bucket_sum = sum(held_out_buckets.values())
+    if _bucket_sum != flagged_held_out_total:
+        print("\n" + "=" * 74)
+        print("  SB-2/SB-3 COUNT RECONCILIATION FAILURE (held-out buckets do not sum):")
+        print(f"  flagged={len(flagged)} published={len(pub)} held-out-total={flagged_held_out_total}")
+        print(f"  named buckets sum to {_bucket_sum}: {held_out_buckets}")
+        print("  A flagged-but-unpublished row has no named home (orphaned count). ABORT — publishing nothing.")
+        print("=" * 74)
+        sys.exit(2)
 
     # EMPTY-REPORT GUARD (acceptance rule): COAs exist for this window (all_results is non-empty after the
     # date filter) — so the report MUST carry information. If NOTHING parsed (no record has any usable
@@ -12129,6 +12721,20 @@ def main():
         _window_years = set()
     _ry_years = sorted(_window_years | set(coa_year_seen))
     fmt_year_rows = [fmt_learner.year_summary(y) for y in _ry_years]
+    # F-2 GUARD — the per-year readiness EVIDENCE shown to officials must never contradict the verdict:
+    # a year rated READY MUST meet the three verdict-gating criteria (sufficient sample, confidence/
+    # uncertainty, and universal core-panel coverage — the exact conditions in COAFormatLearner._verdict).
+    # Lab-layout coverage is a presentational criterion (not a verdict gate), so it is excluded here.
+    for _r in fmt_year_rows:
+        if _r.get("verdict") == "READY":
+            _n = int(_r.get("sampled", 0) or 0)
+            _cc = _r.get("core_cov", {}) or {}
+            _cr = float(_r.get("conf_rate", 0.0) or 0.0)
+            _ur = (int(_r.get("uncertain", 0) or 0) / _n) if _n else 1.0
+            _wu = min(_cc.get("cannabinoids", 0.0), _cc.get("microbials", 0.0))
+            assert (_n >= COAFormatLearner.MIN_SAMPLE and _cr >= 0.85 and _ur <= 0.15 and _wu >= 0.50), (
+                f"F-2 readiness contradiction: year {_r.get('year')} is READY but verdict-gating criteria "
+                f"unmet (n={_n}, conf={_cr:.2f}, unc={_ur:.2f}, weak_universal={_wu:.2f})")
     # --- TRAINING LEDGER binding (Phases 1/2/6): record which training_run_id the report relied on, and
     #     prove the report used the trained parser/analysis version (else flag a TRAINING PIPELINE
     #     DISCONNECT). Write the P1 training->report traceability export.
@@ -12213,8 +12819,7 @@ def main():
     # Cannabinoid review split into THREE separate buckets: non-infused flower,
     # infused flower products, and vapes/concentrates/extracts (never combined).
     thc_flower, infused_potency, extract_potency = [], [], []
-    potency_typemismatch = []   # ITEM 1: flower-classified rows with >45% Total THC (held for product-type review)
-    implausible_flower = 0
+    potency_typemismatch = []   # ITEM 1 / B-2: flower-classified rows with >45% Total Cannabinoids
     for p in pub:
         rv = thc_review_value(p)
         if not rv or rv[1] <= THC_REVIEW_PCT:
@@ -12223,16 +12828,27 @@ def main():
         if cat == "flower":
             if rv[1] <= FLOWER_CANN_MAX:
                 thc_flower.append((p, rv[0], rv[1]))
-            else:
-                # >45% on flower = implausible for dry flower -> route to Product-Type / Potency
-                # Classification Review (NOT a high-THC flower finding), with a reclassification guess.
-                implausible_flower += 1
-                potency_typemismatch.append((p, rv[1], v5.suspected_nonflower_type(p)))
+            # >45% on flower is routed to Section C below (computed over the SAME population as the
+            # Top-100 flower table so the two can never disagree — see B-2 fix).
         elif cat == "infused":
             infused_potency.append((p, rv[0], rv[1]))
         elif cat == "extract":
             extract_potency.append((p, rv[0], rv[1]))
         # 'other' (edibles/tinctures/etc.) -> not part of the cannabinoid review
+    # B-2: the Product-Type / Potency Classification Review (Section C) must cover EVERY non-infused-flower
+    # row showing >45% Total Cannabinoids — the SAME population the Top-100 flower table draws from
+    # (all_results, NOT just pub). Otherwise a 94% "flower" that passed (unpublished) shows in the table
+    # while Section C wrongly reports "none." Computed once here over all_results; deduped by identity.
+    _seen_tm = set()
+    for p in all_results:
+        if product_category(p) != "flower":
+            continue
+        rv = thc_review_value(p)
+        if rv and rv[1] is not None and rv[1] > FLOWER_CANN_MAX and id(p) not in _seen_tm:
+            _seen_tm.add(id(p))
+            potency_typemismatch.append((p, rv[1], v5.suspected_nonflower_type(p)))
+    potency_typemismatch.sort(key=lambda t: t[1], reverse=True)
+    implausible_flower = len(potency_typemismatch)
     thc_flower.sort(key=lambda t: t[2], reverse=True)
     infused_potency.sort(key=lambda t: t[2], reverse=True)
     extract_potency.sort(key=lambda t: t[2], reverse=True)
@@ -12271,27 +12887,70 @@ def main():
     # DENOMINATOR FIX: count each producer's total over the FULL prefiltered window (`products`),
     # NOT the ledger-reduced scanned set — otherwise "% flagged" = flagged/(mostly-flagged) ≈ 100%
     # (misleading). Over the window it is the honest flagged-of-this-producer's-window-products rate.
-    reviewed_c = Counter(producer_label_short(p.producer, ident) for p in products)
-    flagged_c = Counter(producer_label_short(p.producer, ident) for p in pub)
-    issue_c = defaultdict(Counter); conf_of = {}
+    # V17.5.0: GROUP/JOIN on the stable producer_id (the legal-entity key), NOT the display string — this
+    # is what prevents the swapped-name double-listing. Display is the clean trade_name (one row per id).
+    _pid = lambda p: ident.canonical(p.producer)["producer_id"]
+    reviewed_c = Counter(_pid(p) for p in products)
+    flagged_c = Counter(_pid(p) for p in pub)
+    issue_c = defaultdict(Counter); conf_of = {}; trade_of = {}
     for p in products:
-        conf_of[producer_label_short(p.producer, ident)] = ident.resolve(p.producer)["confidence"]
+        _c = ident.canonical(p.producer)
+        conf_of[_c["producer_id"]] = _c["identity_confidence"]; trade_of[_c["producer_id"]] = _c["trade_name"]
     for p in pub:
-        lab = producer_label_short(p.producer, ident)
+        pid = _pid(p)
         for d in v5.quantified_details(p, watch):
             if v5.is_flag_driver(d):
-                issue_c[lab][d["name"]] += 1
+                issue_c[pid][d["name"]] += 1
         if p.thc_flags and is_noninfused_flower(p):
-            issue_c[lab]["High-THC Flower"] += 1
+            issue_c[pid]["High-THC Flower"] += 1
     producer_rows = []
-    for label, n in reviewed_c.items():
-        fl = flagged_c.get(label, 0)
+    for pid, n in reviewed_c.items():
+        fl = flagged_c.get(pid, 0)
         if fl == 0:
             continue
-        producer_rows.append(dict(label=label, reviewed=n, flagged=fl, pct=fl/n*100,
-                                  top=(issue_c[label].most_common(1)[0][0] if issue_c[label] else "—"),
-                                  conf=conf_of.get(label, 0)))
+        producer_rows.append(dict(producer_id=pid, label=trade_of.get(pid, pid), reviewed=n, flagged=fl,
+                                  pct=fl/n*100,
+                                  top=(issue_c[pid].most_common(1)[0][0] if issue_c[pid] else "—"),
+                                  conf=conf_of.get(pid, 0)))
     producer_rows.sort(key=lambda r: r["flagged"], reverse=True)
+    # G4 / B5 ship-blocker: the ranking joins on producer_id — exactly ONE row per producer.
+    _rank_ids = [r["producer_id"] for r in producer_rows]
+    assert len(_rank_ids) == len(set(_rank_ids)), \
+        f"B5: producer_ranking has duplicate producer_id(s): {[i for i in _rank_ids if _rank_ids.count(i) > 1][:3]}"
+
+    # --- V17.5.0 IDENTITY COLLISION AUDIT (§3): a brand or trade name that maps to >1 DISTINCT legal entity
+    #     is a real ambiguity — NEVER merge, NEVER pick by confidence. Surface every chain side-by-side and
+    #     route to review (REMAINS). The chains are rendered in the Producer Identity appendix.
+    _canon_all = ident.canonical_records()
+    _id_to_canon = {c["producer_id"]: c for c in _canon_all}
+    _name_to_ids = defaultdict(set)
+    for c in _canon_all:
+        for nm in ([c["trade_name"]] + list(c["dba_brands"])):
+            if nm and nm.strip():
+                _name_to_ids[nm.strip().lower()].add(c["producer_id"])
+    identity_collisions = []
+    for nm_lc, ids in _name_to_ids.items():
+        llcs = {(_id_to_canon[i].get("legal_entity_llc") or i) for i in ids}
+        if len(llcs) > 1:
+            chains = [_id_to_canon[i] for i in sorted(ids)]
+            disp = next((n for ch in chains for n in ([ch["trade_name"]] + ch["dba_brands"])
+                         if n.strip().lower() == nm_lc), nm_lc)
+            identity_collisions.append(dict(name=disp, chains=chains))
+    # B3 hard ship-blocker: a colliding legal entity that HAS findings must appear as EXACTLY ONE ranking
+    # row — never merged into another entity, never silently dropped. (Distinct producer_id join guarantees
+    # this; the assertion is the loud safety net required by §5.)
+    for col in identity_collisions:
+        for ch in col["chains"]:
+            pid = ch["producer_id"]
+            if flagged_c.get(pid, 0) > 0 and len([r for r in producer_rows if r["producer_id"] == pid]) != 1:
+                print("\n" + "=" * 74)
+                print(f"  B3 SHIP-BLOCKER: identity collision on '{col['name']}' — colliding producer {pid} "
+                      "is merged or dropped in the ranking (must be exactly one row). ABORT — publishing nothing.")
+                print("=" * 74)
+                sys.exit(2)
+    if identity_collisions:
+        print(f"  IDENTITY COLLISION: {len(identity_collisions)} brand/name(s) map to >1 legal entity "
+              f"(surfaced for manual review, NOT merged): {[c['name'] for c in identity_collisions][:6]}")
 
     lab_flag = Counter(lab_name(p, lmap) for p in pub if v5.report_severity(p, watch) in ("RED", "ORANGE", "YELLOW"))
     lab_thc = Counter(lab_name(p, lmap) for p, _k, _v in thc_flower)
@@ -12375,7 +13034,14 @@ def main():
                                            else ("DISTRUSTED->full live re-pull" if cache_distrusted else "cache verified vs live")))),
         "flagged_total": len(flagged),
         "flagged_published": len(pub),
-        "coa_verification_queue": len(flagged) - len(pub),
+        # A-1 FIX: the verification queue is the REAL not-publishable count, NOT len(flagged)-len(pub)
+        # (which is the whole held-out remainder). The remainder is exposed separately + decomposed.
+        "coa_verification_queue": held_out_buckets["verification_queue"],
+        "flagged_held_out_total": flagged_held_out_total,
+        "held_out_verification_queue": held_out_buckets["verification_queue"],
+        "held_out_uncertain_extraction": held_out_buckets["uncertain_extraction_held"],
+        "held_out_plausibility_gated": held_out_buckets["plausibility_gated"],
+        "held_out_coa_source_mismatch": held_out_buckets["coa_source_mismatch"],
         "high_thc_noninfused_flower": len(thc_flower),
         "implausible_flower_potency_excluded": implausible_flower,
         "product_type_mismatch_held": len(potency_typemismatch),   # item 1: flower>45% -> held for review
@@ -12460,6 +13126,64 @@ def main():
     debug["products_freshly_read_live"] = _freshly_read_live
     debug["products_live_verified_this_run"] = _live_verified
     debug["products_served_from_cache_unverified"] = max(0, _reviewed - _live_verified)
+    # E-3 — SPLIT the cache-served population by PROVENANCE. "Served from cache" is NOT the same as
+    # "unverified": a reused value whose live-verification provenance (timestamp + analysis version +
+    # source SHA-256, stamped by a prior run — E-2) is on file and version-current is a TRUSTED reuse,
+    # not a coverage gap. Only reuse WITHOUT version-current provenance is a real coverage concern.
+    # Computed per-product over all_results (not _online_refetched = the cache-served set) so it never
+    # disturbs the live/cache FAIL-LOUD partition above. Stale = provenance on file but written under an
+    # OLDER analysis version (E-4: a version bump demotes these to "must re-verify").
+    _cache_served = [p for p in all_results if not getattr(p, "_online_refetched", False)]
+    _prov_backed = sum(1 for p in _cache_served if _provenance_current(p))
+    _prov_stale = sum(1 for p in _cache_served if _provenance_state(p) == "stale")
+    _prov_none = sum(1 for p in _cache_served if _provenance_state(p) == "none")
+    debug["cache_served_total"] = len(_cache_served)
+    debug["cache_served_provenance_backed"] = _prov_backed
+    debug["cache_served_stale_version"] = _prov_stale
+    debug["cache_served_no_provenance"] = _prov_none
+    # Internal identity guard (true by construction): backed + stale + none == every cache-served product.
+    assert _prov_backed + _prov_stale + _prov_none == len(_cache_served), (
+        f"E-3 provenance split must cover the cache-served set: {_prov_backed}+{_prov_stale}+{_prov_none} "
+        f"!= {len(_cache_served)}")
+    # SB-6 — EVERY PUBLISHED finding must trace to a recorded live-verification EVENT: either live-verified
+    # THIS run (_online_refetched), or carrying a version-current live-verification provenance record on file
+    # from a prior run (_provenance_current). A published finding that is neither (provenance stale or absent)
+    # cannot prove WHEN/under-what-version its value was verified — the evidentiary backbone for officials.
+    # The per-finding audit is exported (cache_provenance_audit.csv); the COUNT drives the gate: a forensic
+    # --validate run ABORTS on any non-traceable published finding (via _require_live_violations), and every
+    # mode discloses it as a provenance self-check (REMAINS → blocks under --strict-audit/--validate).
+    sb6_rows = []
+    _pub_no_prov = 0
+    for _pp in pub:
+        _st = _provenance_state(_pp)
+        _trace = _st in ("live", "prior")
+        if not _trace:
+            _pub_no_prov += 1
+        sb6_rows.append([
+            getattr(_pp, "product_name", "") or "", getattr(_pp, "producer", "") or "",
+            getattr(_pp, "registration_number", "") or "", getattr(_pp, "report_url", "") or "",
+            _st, "yes" if _trace else "NO",
+            getattr(_pp, "_last_live_verified_at", "") or "",
+            str(getattr(_pp, "_verified_analysis_version", "") or ""),
+            (getattr(_pp, "_source_sha256", "") or "")[:32]])
+    debug["published_findings_total"] = len(pub)
+    debug["published_findings_traceable"] = len(pub) - _pub_no_prov
+    debug["published_findings_without_provenance"] = _pub_no_prov
+    # F-4 — EXPLICIT 2015 ISOLATION. 2015 is permanently NOT READY (historical AltaSci / columnar Northeast
+    # formats) and must NEVER contribute a published value or coverage figure to a modern window. The
+    # date-window enforcement already drops any record whose effective COA test date is out-of-window; this
+    # makes the claim EXPLICIT and FAILS LOUD if a 2015-or-earlier record ever survived into a post-2015
+    # window. Disclosed in debug so the report can state affirmatively that 2015 contributes nothing.
+    _win_lo_year = since[0] if since else None
+    if _win_lo_year and _win_lo_year > 2015:
+        _pre2015 = [p for p in all_results
+                    if (_record_effective_date_tuple(p)[0] or (9999, 0, 0))[0] <= 2015]
+        debug["window_lower_bound_year"] = _win_lo_year
+        debug["pre_window_2015_records_in_window"] = len(_pre2015)
+        debug["window_isolation_2015_contributes"] = len(_pre2015)   # MUST be 0
+        assert not _pre2015, (
+            f"F-4 ISOLATION VIOLATION: {len(_pre2015)} record(s) with a 2015-or-earlier effective COA "
+            f"test date survived into the {_win_lo_year}+ window — 2015 must contribute nothing.")
     debug["pdfs_downloaded_or_opened"] = int(debug.get("coas_fetched", 0) or 0)
     debug["ocr_runs_fresh"] = int(debug.get("ocr_ok", 0) or 0)
     debug["cache_audit_comparisons"] = int(debug.get("cache_audit_sampled_live", 0) or 0)
@@ -12500,7 +13224,11 @@ def main():
                                                                  if str(r["year"]) not in _led_present)
     status, fail_reasons, warn_reasons = validation_summary(
         debug, remaining, zero, src_metrics, _unverified_in_pub, _uncertain_published, _year_readiness)
-    debug["report_status"] = status
+    # SB-1 / A-6: this is the data-VALIDATION VERDICT (a sub-component: PASS / PASS WITH WARNINGS / FAIL),
+    # NOT the canonical run status. The ONE canonical run status is the coverage/verification TIER
+    # (status_tier), set on `report_status` below once cov_audit is computed — so cover, headers,
+    # report_status, status_tier and the debug dump all show the SAME string.
+    debug["validation_verdict"] = status
     debug["validation_fail_reasons"] = fail_reasons
     debug["validation_warn_reasons"] = warn_reasons
     draft = status == "FAIL"
@@ -12509,6 +13237,8 @@ def main():
     cov_audit = compute_run_audit(debug, date_trace, products, all_results, pub, flagged, coa_conflicts,
                                   ident, watch, status, since, until, year_readiness=_year_readiness)
     debug["status_tier"] = cov_audit["status_tier"]
+    # SB-1: report_status IS the canonical run status (== status_tier). One string everywhere.
+    debug["report_status"] = cov_audit["status_tier"]
     debug["cache_replay"] = bool(cov_audit.get("cache_replay"))
     # FIX 3 — FAIL-LOUD dataset-accounting reconciliation. The three buckets MUST equal the in-window
     # total: analyzed + reused-from-ledger + excluded(out-of-window + no-date) == in-window. `excluded` is
@@ -12603,6 +13333,7 @@ def main():
                reg_corroboration=reg_corroboration(all_results),
                flagged=flagged, exec_rows=exec_rows, audit=audit, queue=queue,
                producer_rows=producer_rows, lab_rows=lab_rows, analyte_items=analyte_items,
+               identity_collisions=identity_collisions,
                pesticides=pests, solvents=solvs, mycotoxins=mycos, pathogens=paths,
                thc_flower=thc_flower, infused_potency=infused_potency,
                potency_typemismatch=potency_typemismatch,
@@ -12610,6 +13341,7 @@ def main():
                cleaner=cleaner, cleaner_review=cleaner_review, zero=zero, debug=debug,
                compliance_flags=compliance_flags, ombudsman=ombudsman, tym_findings=tym_findings,
                source_mismatches=source_mismatches, multi_coa=multi_coa, provenance_rows=provenance_rows,
+               sb6_rows=sb6_rows,
                coa_conflicts=coa_conflicts, src_metrics=src_metrics,
                format_holds=format_holds, fmt_year_rows=fmt_year_rows, conf_mix=dict(conf_mix),
                fail_reasons=fail_reasons, warn_reasons=warn_reasons,
@@ -12620,7 +13352,9 @@ def main():
                                excluded_no_date=int(cov_audit.get("excluded_no_test_date", 0)),
                                pdfs_downloaded_live=fetched, pdfs_parsed=max(0, len(all_results) - broken),
                                coas_fetched=fetched, published_findings=len(pub)),
-               n_reviewed=len(products), n_pub=len(pub), n_queue=len(flagged)-len(pub),
+               n_reviewed=len(products), n_pub=len(pub),
+               n_queue=held_out_buckets["verification_queue"],   # A-1: the REAL queue, not the remainder
+               held_out_buckets=held_out_buckets, flagged_held_out_total=flagged_held_out_total,
                n_red=sev_counts.get("RED", 0), n_org=sev_counts.get("ORANGE", 0),
                n_yel=sev_counts.get("YELLOW", 0),
                # n_aqua = the actual High-Cannabinoid SEVERITY tier (every published product gets exactly
@@ -12685,10 +13419,16 @@ def main():
     print("\n" + "=" * 74)
     print(f"  {PRODUCT_NAME.upper()} — REPORT #{report_no} [{status}] IS READY")
     print(f"    {os.path.abspath(out_path)}")
+    # A-1: report the REAL verification queue, not the whole held-out remainder; show the decomposition so
+    # the console line matches the report's Coverage Integrity buckets exactly.
     print(f"  Reviewed {len(all_results):,} • Published {len(pub):,} "
           f"({sev_counts.get('RED',0)} Red, {sev_counts.get('ORANGE',0)} Orange, "
           f"{sev_counts.get('YELLOW',0)} Yellow, {len(thc_flower)} High-THC flower) • "
-          f"{len(flagged)-len(pub)} in COA queue")
+          f"{held_out_buckets['verification_queue']} in COA verification queue")
+    print(f"  Held from publication {flagged_held_out_total} = verification-queue "
+          f"{held_out_buckets['verification_queue']} + uncertain-extraction {held_out_buckets['uncertain_extraction_held']} "
+          f"+ plausibility-gated {held_out_buckets['plausibility_gated']} + source-mismatch "
+          f"{held_out_buckets['coa_source_mismatch']} (= flagged {len(flagged)} − published {len(pub)})")
     # TASK 2 — every verification number printed here maps to exactly ONE field of the single-source-of-truth
     # accounting object (`_acct`). The PRIMARY live-verified count is live_verified_total; cache_audit_repulls
     # is shown under its OWN label and is never again passed off as the live count (the old "Revalidated LIVE"
@@ -12706,7 +13446,7 @@ def main():
           + ("" if _acct.mode.startswith("--validate") else " For full-window re-verification use --validate."))
     # TASK 4 — ONE reconciled coverage breakdown, IDENTICAL to the PDF appendix (same function).
     print("  Coverage breakdown (reconciled to the window):")
-    for _bl in verification_breakdown_lines(_acct):
+    for _bl in verification_breakdown_lines(_acct, debug):
         print("    " + _bl)
     print(f"  COAs marked PASS containing an over-limit body line: {debug.get('coa_pass_with_overlimit_lines', 0)}")
     print(f"  Self-audit remaining: {len(remaining)} • Parser-gap warnings: "
@@ -12725,6 +13465,22 @@ def main():
     print(f"  Status: {status}")
     print(f"  Elapsed {time.time()-t0:.0f}s")
     print("=" * 74)
+    # ---- V17.5.0 PRODUCER IDENTITY — in-run acceptance summary + before/after (§4/§6) ----
+    _canon_run = ident.canonical_records()
+    _paren = [c["trade_name"] for c in _canon_run if "(" in (c["trade_name"] or "")]
+    print("\n  PRODUCER IDENTITY (V17.5.0) — chain model: Legal Entity (LLC) -> Trade Name -> DBA/Brand(s)")
+    print(f"    [{'PASS' if not _paren else 'FAIL'}] G3 no trade_name contains a parenthetical smoosh "
+          f"({len(_paren)} found)")
+    print(f"    [{'PASS' if len({r['producer_id'] for r in producer_rows})==len(producer_rows) else 'FAIL'}] "
+          "G4 ranking is one row per producer_id")
+    print(f"    G5/G6 identity collisions surfaced (NOT merged): {len(identity_collisions)} "
+          f"-> {[c['name'] for c in identity_collisions][:6]}")
+    print( "    BEFORE (<=V17.4.0): ranking '#1 Earl Baker (Early Birds)' / '#5 Early Birds (Earl Baker)' "
+           "(smooshed, swapped); appendix 'RAD Holding Corp. (Earl Baker, Early Birds)'.")
+    print( "    AFTER  (V17.5.0):  ranking = clean trade_name per producer_id; appendix = 3 separate columns "
+           "(LLC | Trade Name | DBA/Brands); 'Earl Baker'/'Early Birds' -> IDENTITY COLLISION (REMAINS).")
+    print(f"    trade_names that previously carried a parenthetical: now {len(_paren)} (target 0); "
+          f"collisions surfaced: {len(identity_collisions)}. Full PDF-text gates: python3 _gates_identity.py <run folder>")
 
 
 # ============================================================================
